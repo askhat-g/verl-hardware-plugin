@@ -45,8 +45,10 @@ def _ensure_torch_tpu() -> bool:
 
 _ensure_torch_tpu()  # Attempt at module load time so availability checks are faster later
 
-# Base port for the TPU distributed slice builder mesh. Each local rank takes ``base + local_rank``.
-TPU_PROCESS_BASE_PORT = 8471
+# Base ports for TPU distributed slice builder meshes. Rollout and trainer use separate ranges.
+ROLLOUT_BASE_PORT = 8070
+TRAINER_BASE_PORT = 8471
+TPU_PROCESS_BASE_PORT = TRAINER_BASE_PORT
 
 # TPU chip HBM capacities in bytes
 HBM_BYTES_TPU_V5P = 95 * 1024 * 1024 * 1024  # 95 GB
@@ -408,7 +410,8 @@ class PlatformTPU(PlatformBase):
                 if node_id in node_ip_map:
                     bundle_ips.append(node_ip_map[node_id])
 
-        base_port = TPU_PROCESS_BASE_PORT
+        is_rollout = "rollout" in name_prefix.lower()
+        base_port = ROLLOUT_BASE_PORT if is_rollout else TRAINER_BASE_PORT
         sb_addresses = [f"{ip}:{base_port + (b_idx % local_world_size)}" for b_idx, ip in enumerate(bundle_ips)]
 
         # Extract unique worker hostnames preserving rank order
@@ -438,7 +441,50 @@ class PlatformTPU(PlatformBase):
             }
         )
 
+        if is_rollout:
+            env_vars.update(
+                {
+                    "SKIP_JAX_PRECOMPILE": "1",
+                    "VLLM_ENABLE_V1_MULTIPROCESSING": "1",
+                }
+            )
+            if world_size > 1:
+                env_vars["TPU_MULTIHOST_BACKEND"] = "ray"
+
         return env_vars
+
+    def auto_assign_accelerator_type(self, name_prefix: str, accelerator_type: Optional[str]) -> Optional[str]:
+        """Dynamically assign a TPU slice/group affinity to a resource pool on multi-slice clusters."""
+        if accelerator_type is not None:
+            return accelerator_type
+
+        try:
+            if ray.is_initialized():
+                tpu_slices = set()
+                for node in ray.nodes():
+                    if node.get("Alive"):
+                        for res in node.get("Resources", {}).keys():
+                            if res.startswith("tpu-group-"):
+                                tpu_slices.add(res)
+                tpu_slices = sorted(list(tpu_slices))
+                if len(tpu_slices) >= 1:
+                    if len(tpu_slices) >= 2 and any(k in name_prefix.lower() for k in ["rollout", "reward", "teacher"]):
+                        return tpu_slices[1]
+                    return tpu_slices[0]
+        except Exception:
+            pass
+
+        return accelerator_type
+
+    def configure_placement_group_bundle(
+        self, bundle: dict, use_gpu: bool, device_name: str, name_prefix: str, accelerator_type: Optional[str] = None
+    ) -> None:
+        """Configure placement group bundle resources to prevent vLLM resource lockups on GKE TPU."""
+        is_rollout_pool = any(k in name_prefix.lower() for k in ["rollout", "reward", "teacher"])
+        if use_gpu and not is_rollout_pool:
+            bundle[device_name] = 1
+        if accelerator_type is not None:
+            bundle[accelerator_type] = 1e-4
 
     def get_worker_env_vars(
         self,
@@ -467,3 +513,24 @@ class PlatformTPU(PlatformBase):
         )
         env_vars.update(tpu_env)
         return env_vars
+
+    def sanitize_metrics(self, metrics: Any) -> Any:
+        """Convert any TPU tensor in metrics to a standard Python scalar before Ray RPC transfer."""
+        from verl_hardware_plugin.platforms.platform_tpu_workarounds import convert_tensors_to_scalars
+
+        return convert_tensors_to_scalars(metrics)
+
+    def rollout_env_vars(self) -> dict[str, str]:
+        """Return compiler/runtime flags to forward into the rollout server actor."""
+        return {var: os.environ[var] for var in ("XLA_FLAGS", "LIBTPU_INIT_ARGS") if os.environ.get(var)}
+
+    def get_ray_init_kwargs(self) -> dict[str, Any]:
+        """Return Ray initialization arguments with runtime_env configured for GKE TPU workers."""
+        from verl_hardware_plugin.platforms.platform_tpu_workarounds import patch_ray_worker
+
+        return {
+            "runtime_env": {
+                "worker_process_setup_hook": patch_ray_worker,
+                "env_vars": {"VERL_PLATFORM": "tpu"},
+            }
+        }

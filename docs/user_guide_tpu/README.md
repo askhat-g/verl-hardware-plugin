@@ -2,11 +2,12 @@
 
 ## Introduction
 
-This document describes Google TPU support in `verl-hardware-plugin`.
+This document describes Google TPU support in `verl-hardware-plugin` for both **Supervised Fine-Tuning (SFT)** and **Group Relative Policy Optimization (GRPO) RL** workloads on Cloud TPU v6e slices.
 
 The plugin registers:
-- **`PlatformTPU`**: Device metadata, Ray resource configuration, and PJRT worker slice environment.
-- **`TorchTitanTPUEngineWithLMHead`**: TorchTitan training engine (`engine=torchtitan`) with static 256-token sequence bucketing (`VERL_TPU_SEQ_BUCKET_SIZE=256`) and pure FSDP2 support on `torch_tpu`.
+- **`PlatformTPU`**: Device metadata, multi-slice Ray placement group isolation (`ROLLOUT_BASE_PORT=8070` vs `TRAINER_BASE_PORT=8471`), and PJRT worker slice environment.
+- **`TorchTitanTPUEngineWithLMHead`**: TorchTitan training engine (`engine=torchtitan` / `actor_rollout_ref.actor.strategy=torchtitan`) with static 256-token sequence bucketing (`VERL_TPU_SEQ_BUCKET_SIZE=256`) and pure FSDP2 support on `torch_tpu`.
+- **`TPUCheckpointEngine`**: High-speed weight synchronization (`actor_rollout_ref.rollout.checkpoint_engine.backend=tpu`) via `TPUWeightRegistry` and host-side TP sharding/QKV fusion for vLLM TPU rollout workers.
 
 ## Directory Structure
 
@@ -14,25 +15,22 @@ The plugin registers:
 verl_hardware_plugin/
 ├── engines
 │   ├── torchtitan_tpu.py             # TPU TorchTitan training engine
-│   └── torchtitan_tpu_utils.py       # Static sequence bucketing & TPU attention helpers
+│   ├── torchtitan_tpu_utils.py       # Static sequence bucketing & TPU attention helpers
+│   ├── tpu_checkpoint_engine.py      # TPU weight sync checkpoint engine
+│   └── tpu_weight_registry.py        # Detached Ray actor holding weight references
 ├── platforms
-│   ├── platform_tpu.py               # TPU platform settings
+│   ├── platform_tpu.py               # TPU platform & multi-slice mesh settings
 │   └── platform_tpu_workarounds.py   # Multi-host metric aggregation & Ray worker helpers
 └── utils
-    └── tpu_sft_hooks.py              # TPU SFT loss unpacking & runtime hooks
-```
-
-```text
-user_guide_tpu/
-├── README.md                         # This file
-├── install_guidance.md               # Installation and environment setup
-└── quick_start.md                    # Selecting the platform and running SFT training
+    ├── tpu_grpo_hooks.py             # vLLM rollout server helpers & PPO loss hooks
+    ├── tpu_sft_hooks.py              # TPU SFT loss unpacking & metric hooks
+    └── tpu_vllm_patch.py             # Concat-free vLLM RoPE & compile cache patches
 ```
 
 ## Getting Started
 
 - [Installation Guide](./install_guidance.md) — prerequisites and environment setup
-- [Quick Start](./quick_start.md) — verify the platform/engine and run an SFT training job
+- [Quick Start](./quick_start.md) — verify the platform/engines and run SFT or GRPO RL training
 
 ## Platform Summary
 
@@ -40,26 +38,11 @@ user_guide_tpu/
 |------|-------------|
 | Device type | `tpu` |
 | Vendor identifier | `google` |
-| Training engine | `TorchTitanTPUEngineWithLMHead` (`engine=torchtitan`) |
+| Training engine | `TorchTitanTPUEngineWithLMHead` (`torchtitan`) |
+| Checkpoint engine | `TPUCheckpointEngine` (`tpu`) |
+| Rollout engine | `vLLM` (`vllm-torchtpu`) |
 | Communication backend | `tpu_dist` (registered by `torch_tpu`) |
-| Device visibility env var | `CUDA_VISIBLE_DEVICES` (see note below) |
+| Device visibility env var | `CUDA_VISIBLE_DEVICES` |
 | Ray resource name | `TPU` |
-| IPC support | No |
-| Colocated worker groups | Not supported — a chip belongs to a single process |
-
-### Why the visibility env var is `CUDA_VISIBLE_DEVICES`
-
-This is intentional. verl assigns `os.environ[<this key>]` when launching vLLM servers. Pointing it
-at `TPU_VISIBLE_CHIPS` would overwrite the per-worker chip index that the platform sets through
-`get_worker_env_vars()` and reads back through `ray_local_rank_override()`, breaking rank mapping.
-The two variables serve different purposes and must not be merged.
-
-## Chip Support
-
-| Generation | HBM per chip | Topologies with a built-in mapping |
-|------------|--------------|------------------------------------|
-| v6e | 32 GB | `v6e-4`, `v6e-8`, `v6e-32` |
-
-## Related Documentation
-
-- [verl plugin system](../development.md)
+| IPC support | No (uses Ray Object Store via `TPUWeightRegistry`) |
+| Colocated worker groups | Not supported — separate slices for Trainer and Rollout |
