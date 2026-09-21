@@ -51,6 +51,9 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanEngineWithLMHead):
         optimizer_config: TorchtitanOptimizerConfig,
         checkpoint_config: CheckpointConfig,
     ):
+        from verl_hardware_plugin.utils.tpu_sft_hooks import apply_tpu_sft_hooks
+
+        apply_tpu_sft_hooks()
 
         if engine_config.tensor_parallel_size > 1:
             logger.warning(

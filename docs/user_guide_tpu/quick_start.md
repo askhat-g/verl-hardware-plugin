@@ -1,8 +1,6 @@
 # Google TPU Quick Start
 
-> **There is no TPU training quick start yet.** TPU support is at the platform layer only. A GRPO
-> or PPO run cannot be launched on TPU from stock verl today — see the status note in the
-> [User Guide](./README.md). This page covers what you can verify now.
+This page covers verifying the TPU platform and TorchTitan engine registration and running Supervised Fine-Tuning (SFT) on Cloud TPU v6e.
 
 ## 1. Select the Platform
 
@@ -13,22 +11,20 @@ export VERL_PLATFORM=tpu
 export PJRT_DEVICE=TPU
 ```
 
-Auto-detection also works on a TPU host, because each registered platform is probed in turn and only
-the TPU probe succeeds. But that outcome depends on registration order, which is not a stable
-contract. `VERL_PLATFORM=tpu` is the supported way to select TPU.
-
-## 2. Verify Platform Resolution
+## 2. Verify Platform and Engine Resolution
 
 ```bash
-python3 -c '
+VERL_PLATFORM=tpu python3 -c '
 from verl.plugin.platform.platform_manager import get_platform
+from verl.workers.engine.base import EngineRegistry
+import verl_hardware_plugin
+
 p = get_platform()
 print("device:   ", p.device_name)
 print("vendor:   ", p.vendor_name)
 print("backend:  ", p.communication_backend_name())
 print("ray res:  ", p.ray_resource_name())
-print("ipc:      ", p.is_ipc_supported())
-print("colocate: ", p.supports_colocated_worker_groups())
+print("engine:   ", EngineRegistry.get_engine_cls("language_model", "torchtitan").__name__)
 '
 ```
 
@@ -39,35 +35,25 @@ device:    tpu
 vendor:    google
 backend:   tpu_dist
 ray res:   TPU
-ipc:       False
-colocate:  False
+engine:    TorchTitanTPUEngineWithLMHead
 ```
 
-## 3. Verify Ray Resource Requests
+## 3. Run SFT Training (`Qwen3-0.6B` on `GSM8K`)
 
-The platform requests chips as a custom Ray resource named `TPU`, not as `num_gpus`:
+Use [`scripts/run_sft_qwen3_0_6b_tpu.sh`](../../scripts/run_sft_qwen3_0_6b_tpu.sh) to run Multi-Turn / Instruction SFT with the TorchTitan engine (`engine=torchtitan`) on a TPU v6e-8 slice (2 hosts $\times$ 4 chips/host) or TPU v6e-4 slice:
 
 ```bash
-python3 -c '
-from verl.plugin.platform.platform_manager import get_platform
-print(get_platform().ray_resource_options(4))
-'
+# Quick 8-step smoke test on a single-host TPU v6e-4 (1 host x 4 chips)
+SMOKE_TEST=1 NNODES_TRAINER=1 N_CHIPS_TRAINER=4 DATA_PARALLEL_SHARD_SIZE=4 \
+  bash scripts/run_sft_qwen3_0_6b_tpu.sh
+
+# Full SFT run on a 2-host TPU v6e-8 slice (2 hosts x 4 chips)
+NNODES_TRAINER=2 N_CHIPS_TRAINER=4 DATA_PARALLEL_SHARD_SIZE=8 \
+  bash scripts/run_sft_qwen3_0_6b_tpu.sh
 ```
-
-Expected output: `{'resources': {'TPU': 4}}`
-
-Your Ray cluster must advertise a `TPU` resource for scheduling to succeed. On KubeRay this comes
-from the TPU node pool's resource annotations.
 
 ## 4. Run the Plugin Test Suite
 
 ```bash
-pytest tests/test_plugin_registration.py -k tpu -v
+pytest tests/test_plugin_registration.py tests/test_tpu_sft_hooks.py -v
 ```
-
-Expected: all TPU cases pass. These run on any host, with or without a TPU attached.
-
-## Next Steps
-
-The core-side hook call sites are still unmerged in verl. The TPU training engine will land in a
-follow-up PR to this plugin.
