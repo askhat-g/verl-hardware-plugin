@@ -37,10 +37,20 @@ def _stub_training_engine_runtimes():
     megatron_transformer.MegatronEngineWithLMHead = _ImportPlaceholder
     megatron_transformer.MegatronEngineWithValueHead = _ImportPlaceholder
 
+    torchtitan = ModuleType("verl.workers.engine.torchtitan")
+    torchtitan.TorchTitanEngine = _ImportPlaceholder
+    torchtitan.TorchTitanEngineWithLMHead = _ImportPlaceholder
+
+    torchtitan_transformer = ModuleType("verl.workers.engine.torchtitan.transformer_impl")
+    torchtitan_transformer.TorchTitanEngine = _ImportPlaceholder
+    torchtitan_transformer.TorchTitanEngineWithLMHead = _ImportPlaceholder
+
     engine_modules = {
         "verl.workers.engine.fsdp": fsdp,
         "verl.workers.engine.fsdp.transformer_impl": fsdp_transformer,
         "verl.workers.engine.megatron.transformer_impl": megatron_transformer,
+        "verl.workers.engine.torchtitan": torchtitan,
+        "verl.workers.engine.torchtitan.transformer_impl": torchtitan_transformer,
     }
     with (
         mock.patch.dict(os.environ, {"VERL_USE_EXTERNAL_PLUGINS": "none"}),
@@ -59,6 +69,10 @@ def _stub_training_engine_runtimes():
         megatron_transformer.MegatronEngine = _StubEngine
         megatron_transformer.MegatronEngineWithLMHead = _StubEngine
         megatron_transformer.MegatronEngineWithValueHead = _StubEngine
+        torchtitan.TorchTitanEngine = _StubEngine
+        torchtitan.TorchTitanEngineWithLMHead = _StubEngine
+        torchtitan_transformer.TorchTitanEngine = _StubEngine
+        torchtitan_transformer.TorchTitanEngineWithLMHead = _StubEngine
         yield
 
 
@@ -519,6 +533,89 @@ class TestEngineRegistration:
             EngineRegistry._engines["language_model"]["megatron"][("gcu", "enflame")] is MegatronEnflameEngineWithLMHead
         )
 
+    def test_torchtitan_tpu_engine_registered(self):
+        from verl.workers.engine.base import EngineRegistry
+        from verl_hardware_plugin.engines.torchtitan_tpu import TorchTitanTPUEngineWithLMHead
+
+        assert (
+            EngineRegistry._engines["language_model"]["torchtitan"][("tpu", "google")] is TorchTitanTPUEngineWithLMHead
+        )
+
+    def test_torchtitan_tpu_engine_resolves_for_tpu_platform(self):
+        from verl.workers.engine.base import EngineRegistry
+        from verl_hardware_plugin.engines.torchtitan_tpu import TorchTitanTPUEngineWithLMHead
+        from verl_hardware_plugin.platforms.platform_tpu import PlatformTPU  # noqa: F401
+
+        with _fresh_registries():
+            with mock.patch.dict(os.environ, {"VERL_PLATFORM": "tpu"}):
+                cls = EngineRegistry.get_engine_cls("language_model", "torchtitan")
+                assert cls is TorchTitanTPUEngineWithLMHead
+
+    def test_torchtitan_tpu_sequence_bucketing_helpers(self):
+        import torch
+        from tensordict import TensorDict
+
+        from verl_hardware_plugin.engines.torchtitan_tpu_utils import (
+            bucket_length,
+            pad_packed_inputs_for_tpu,
+            safe_to_padded_tensor,
+            tpu_no_padding_2_padding,
+            unwrap_metadata,
+        )
+
+        # 1. bucket_length rounds up to multiples of bucket_size
+        assert bucket_length(1, 256) == 256
+        assert bucket_length(256, 256) == 256
+        assert bucket_length(257, 256) == 512
+
+        # 2. unwrap_metadata unwraps lists and single-element tensors
+        assert unwrap_metadata([torch.tensor([3.5])]) == 3.5
+        assert unwrap_metadata(torch.tensor([42])) == 42
+
+        # 3. pad_packed_inputs_for_tpu pads 1D jagged sequences to 256-token buckets
+        seq1 = torch.tensor([10, 11, 12, 13], dtype=torch.int64)
+        seq2 = torch.tensor([20, 21, 22], dtype=torch.int64)
+        input_ids_nt = torch.nested.as_nested_tensor([seq1, seq2], layout=torch.jagged)
+        pos1 = torch.arange(4, dtype=torch.int64)
+        pos2 = torch.arange(3, dtype=torch.int64)
+        pos_nt = torch.nested.as_nested_tensor([pos1, pos2], layout=torch.jagged)
+        resp_nt = torch.nested.as_nested_tensor([seq1[2:], seq2[1:]], layout=torch.jagged)
+
+        micro_batch = TensorDict(
+            {"input_ids": input_ids_nt, "position_ids": pos_nt, "responses": resp_nt},
+            batch_size=[2],
+        )
+        with mock.patch.dict(os.environ, {"VERL_TPU_SEQ_BUCKET_SIZE": "16"}):
+            in_padded, pos_padded, labels_padded, attn_mask, orig_len = pad_packed_inputs_for_tpu(
+                input_ids_nt, pos_nt, micro_batch, device=torch.device("cpu")
+            )
+            assert orig_len == 7
+            assert in_padded.shape == (1, 16)
+            assert pos_padded.shape == (1, 16)
+            assert labels_padded.shape == (1, 16)
+            assert attn_mask.shape == (1, 1, 16, 16)
+            # Token 4 (in seq2) must not attend to Token 3 (in seq1)
+            assert bool(attn_mask[0, 0, 4, 3]) is False
+            # Token 5 (in seq2) must attend to Token 4 (in seq2)
+            assert bool(attn_mask[0, 0, 5, 4]) is True
+
+            # 4. safe_to_padded_tensor pads NestedTensor to bucketed length on CPU
+            dense_resp = safe_to_padded_tensor(resp_nt, padding=0)
+            assert dense_resp.shape == (2, 16)
+
+            # 5. tpu_no_padding_2_padding extracts response positions into static bucket shape
+            prompt_nt = torch.nested.as_nested_tensor([seq1[:2], seq2[:1]], layout=torch.jagged)
+            data_td = TensorDict({"prompts": prompt_nt, "responses": resp_nt}, batch_size=[2])
+            fake_logprobs = torch.nested.as_nested_tensor(
+                [torch.arange(4, dtype=torch.float32), torch.arange(3, dtype=torch.float32) + 10.0],
+                layout=torch.jagged,
+            )
+            fake_logprobs._tpu_padded_values = torch.cat(
+                [torch.arange(4, dtype=torch.float32), torch.arange(3, dtype=torch.float32) + 10.0, torch.zeros(9)]
+            )
+            gathered = tpu_no_padding_2_padding(fake_logprobs, data_td)
+            assert gathered.shape == (2, 16)
+
 
 class TestFLEnvManager:
     """Test FLEnvManager utility."""
@@ -681,6 +778,30 @@ class TestMayEnableFlagGems:
                 ):
                     with pytest.raises(ValueError, match="Cannot set both whitelist and blacklist"):
                         may_enable_flag_gems(phase="training")
+
+    def test_tpu_document_attention_replacement(self):
+        import torch
+
+        from verl_hardware_plugin.engines.torchtitan_tpu_utils import (
+            TPUDocumentAttention,
+            replace_varlen_attention_with_tpu_attention,
+        )
+
+        class DummyLayer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.inner_attention = torch.nn.Identity()
+
+        model = DummyLayer()
+        replaced = replace_varlen_attention_with_tpu_attention([model])
+        assert replaced == 1
+        assert isinstance(model.inner_attention, TPUDocumentAttention)
+
+        q = torch.randn(1, 8, 4, 16)
+        k = torch.randn(1, 8, 2, 16)
+        v = torch.randn(1, 8, 2, 16)
+        out = model.inner_attention(q, k, v)
+        assert out.shape == (1, 8, 4, 16)
 
 
 if __name__ == "__main__":
