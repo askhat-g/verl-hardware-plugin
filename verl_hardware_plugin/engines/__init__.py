@@ -172,3 +172,10 @@ def register_all_engines():
         logger.info("Registered engines: torchtitan_tpu")
     except Exception as e:
         logger.debug("TPU TorchTitan engine not registered: %s", e)
+
+    try:
+        from verl_hardware_plugin.engines import tpu_checkpoint_engine  # noqa: F401
+
+        logger.info("Registered engines: tpu_checkpoint_engine")
+    except Exception as e:
+        logger.debug("TPU Checkpoint engine not registered: %s", e)
