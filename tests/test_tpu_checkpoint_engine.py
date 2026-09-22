@@ -94,3 +94,74 @@ def test_pack_and_load_weights_with_qkv_fusion_and_tp_sharding():
     assert torch.equal(model_r1.layers[0]["self_attn"].qkv_proj.weight.data, expected_r1_qkv)
     # tok_embeddings should also populate lm_head.weight
     assert torch.equal(model_r0.lm_head.weight.data, emb_w)
+
+
+def test_streaming_weight_loader_cross_bucket_qkv_fusion():
+    from verl_hardware_plugin.engines.tpu_checkpoint_engine import TPUStreamingWeightLoader
+
+    q_w = torch.arange(16, dtype=torch.bfloat16).reshape(4, 4)
+    k_w = (torch.arange(8, dtype=torch.bfloat16) + 100).reshape(2, 4)
+    v_w = (torch.arange(8, dtype=torch.bfloat16) + 200).reshape(2, 4)
+    emb_w = (torch.arange(32, dtype=torch.bfloat16) + 300).reshape(8, 4)
+
+    model_r0 = _DummyRolloutModel(tp_size=2, flipped=False)
+    loader = TPUStreamingWeightLoader(model_r0, rank=0, target_device="cpu")
+
+    # Bucket 0 contains only q_proj and k_proj (v_proj is in Bucket 1)
+    loaded_b0 = loader.load_bucket(
+        [
+            ("_fsdp_wrapped_module.layers.0.self_attn.q_proj.weight", q_w),
+            ("_fsdp_wrapped_module.layers.0.self_attn.k_proj.weight", k_w),
+        ]
+    )
+    assert loaded_b0 == 0
+    assert len(loader.pending_raw_tensors) == 2
+
+    # Bucket 1 delivers v_proj and tok_embeddings -> completes qkv_proj fusion
+    loaded_b1 = loader.load_bucket(
+        [
+            ("_fsdp_wrapped_module.layers.0.self_attn.v_proj.weight", v_w),
+            ("_fsdp_wrapped_module.tok_embeddings.weight", emb_w),
+        ]
+    )
+    assert loaded_b1 == 2
+    assert len(loader.pending_raw_tensors) == 0
+    loader.finalize()
+
+    expected_r0_qkv = torch.cat([q_w[:2], k_w[:1], v_w[:1]], dim=0)
+    assert torch.equal(model_r0.layers[0]["self_attn"].qkv_proj.weight.data, expected_r0_qkv)
+    assert torch.equal(model_r0.lm_head.weight.data, emb_w)
+
+
+def test_tpu_weight_registry_bucket_acks_and_topology():
+    import asyncio
+
+    async def _run():
+        reg = TPUWeightRegistryState()
+        await reg.set_bucket(
+            step=1, bucket_idx=0, bucket_ref_list=["ref0"], bucket_meta={"k": 1}, is_last=True, num_receivers=2
+        )
+        entry = await reg.get_bucket(step=1, bucket_idx=0)
+        assert entry == (["ref0"], {"k": 1}, True)
+
+        await reg.ack_bucket(step=1, bucket_idx=0)
+        assert (1, 0) in reg.buckets
+        await reg.ack_bucket(step=1, bucket_idx=0)
+        await reg.wait_bucket_acks(step=1, bucket_idx=0)
+        assert (1, 0) not in reg.buckets
+
+    asyncio.run(_run())
+
+    actor_kw, rollout_kw = TPUCheckpointEngine.build_topology(
+        actor_wg_world_size=4,
+        rollout_world_size=2,
+        metadata=[
+            {"is_master": True, "sync_round": 3},
+            {"is_master": False},
+            {"is_master": False},
+            {"is_master": False},
+        ],
+    )
+    assert actor_kw["rank"] == [0, None, None, None]
+    assert rollout_kw["rank"] == [1, 2]
+    assert rollout_kw["world_size"] == [3, 3]
