@@ -89,9 +89,9 @@ def _nested_module_statements(statements: Iterable[ast.stmt]) -> Iterable[ast.st
     for statement in statements:
         yield statement
         nested: list[list[ast.stmt]] = []
-        if isinstance(statement, (ast.If, ast.For, ast.AsyncFor, ast.While)):
+        if isinstance(statement, ast.If | ast.For | ast.AsyncFor | ast.While):
             nested.extend([statement.body, statement.orelse])
-        elif isinstance(statement, (ast.With, ast.AsyncWith)):
+        elif isinstance(statement, ast.With | ast.AsyncWith):
             nested.append(statement.body)
         elif isinstance(statement, ast.Try):
             nested.extend([statement.body, statement.orelse, statement.finalbody])
@@ -123,7 +123,7 @@ def _resolve_import_from(current_module: str, module_path: Path, imported_module
 def _literal_string_collection(node: ast.expr) -> set[str] | None:
     """Evaluate a static collection of strings used for ``__all__``."""
 
-    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+    if isinstance(node, ast.List | ast.Tuple | ast.Set):
         values: set[str] = set()
         for element in node.elts:
             if not isinstance(element, ast.Constant) or not isinstance(element.value, str):
@@ -180,7 +180,7 @@ def _module_surface(
     star_imports: set[str] = set()
 
     for statement in _nested_module_statements(tree.body):
-        if isinstance(statement, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+        if isinstance(statement, ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
             bindings.add(statement.name)
         elif isinstance(statement, ast.Import):
             for alias in statement.names:
