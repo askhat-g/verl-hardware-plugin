@@ -379,13 +379,14 @@ def load_weights_from_ray_registry(self: Any, step_key: int) -> int:
 
 
 @CheckpointEngineRegistry.register("tpu")
+@CheckpointEngineRegistry.register("tpu_ray")
 class TPUCheckpointEngine(CheckpointEngine):
     """Checkpoint engine for transferring model weights from TorchTitan trainer to vLLM rollout on TPU via Ray."""
 
     def __init__(self, bucket_size: int = 0, is_master: bool = False, **kwargs: Any) -> None:
         self.is_master = is_master
         self.bucket_size = bucket_size
-        self.registry: Any = None
+        self.registry = None
 
         if ray.is_initialized():
             try:
@@ -604,7 +605,7 @@ def apply_tpu_checkpoint_engine_hooks() -> None:
 
             @ckpt_base.auto_await
             async def _patched_mgr_update(self, global_steps: int | None = None):
-                if self.backend == "tpu":
+                if self.backend in ("tpu", "tpu_ray"):
                     return await update_tpu_weights(self, global_steps=global_steps)
                 res = _orig_mgr_update(self, global_steps=global_steps)
                 if inspect.isawaitable(res):
