@@ -33,6 +33,7 @@ def test_tpu_checkpoint_engine_registered():
     from verl.checkpoint_engine.base import CheckpointEngineRegistry
 
     assert CheckpointEngineRegistry.get("tpu") is TPUCheckpointEngine
+    assert CheckpointEngineRegistry.get("tpu_ray") is TPUCheckpointEngine
 
 
 def test_ray_weight_registry_write_eviction():
