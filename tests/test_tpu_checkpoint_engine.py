@@ -3,6 +3,7 @@
 
 """Unit tests for TPUCheckpointEngine, TPUWeightRegistry, and worker weight sharding/fusion."""
 
+import logging
 import sys
 from types import ModuleType
 
@@ -23,6 +24,7 @@ for _mod_name in ("uvicorn", "fastapi"):
 from verl_hardware_plugin.engines.ray_weight_registry import RayWeightRegistryState  # noqa: E402
 from verl_hardware_plugin.engines.tpu_checkpoint_engine import (  # noqa: E402
     TPUCheckpointEngine,
+    apply_tpu_checkpoint_engine_hooks,
     get_clean_name,
     get_layer_group,
     load_weights_on_worker,
@@ -33,6 +35,12 @@ def test_tpu_checkpoint_engine_registered():
     from verl.checkpoint_engine.base import CheckpointEngineRegistry
 
     assert CheckpointEngineRegistry.get("tpu") is TPUCheckpointEngine
+
+
+def test_apply_tpu_checkpoint_engine_hooks_logs_importerror(caplog):
+    with caplog.at_level(logging.DEBUG, logger="verl_hardware_plugin.engines.tpu_checkpoint_engine"):
+        apply_tpu_checkpoint_engine_hooks()
+    assert any("caused ImportError" in rec.message for rec in caplog.records)
 
 
 def test_ray_weight_registry_write_eviction():

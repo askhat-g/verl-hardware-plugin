@@ -380,7 +380,36 @@ def load_weights_from_ray_registry(self: Any, step_key: int) -> int:
 
 @CheckpointEngineRegistry.register("tpu")
 class TPUCheckpointEngine(CheckpointEngine):
-    """Checkpoint engine for transferring model weights from TorchTitan trainer to vLLM rollout on TPU via Ray."""
+    """Checkpoint engine for transferring model weights from TorchTitan trainer to vLLM rollout on TPU via Ray.
+
+    Trainer rank 0 all-gathers sharded ``DTensor`` parameters, packs them into Ray Plasma
+    (``ray.put``), and registers the ``ObjectRef`` in ``RayWeightRegistry``. Rollout ``TPUWorker``
+    processes (invoked via ``collective_rpc``) then pull the state dict from Plasma, shard/fuse
+    parameters for their tensor-parallel rank, and copy them into TPU HBM::
+
+         [Trainer TPU 0]                                   [Rollout TPU k]
+        +-------------------------------+                 +---------------------------------+
+        | Process 1:                    |                 | Process 1 (CPU-ONLY STUB!):     |
+        | ActorRolloutRefWorker         |                 | CheckpointEngineWorker          |
+        |  - TorchTitanEngine           |                 |  - use_gpu=False (0 TPU chips)  |
+        |  - TPUCheckpointEngine        |                 |  - checkpoint_engine = None     |
+        |    (Offloads full model to    |                 +---------------------------------+
+        |     CPU & ray.put(state_dict))|
+        +---------------+---------------+                 +---------------------------------+
+                        |                                 | Process 2 (EXCLUSIVE TPU OWNER):|
+                        | set_weights(step, [ref])        | vLLM TPUWorker (owns libtpu)    |
+                        v                                 |  - Patched with                 |
+              +-------------------+     1. Lookup [ref]   |    load_weights_from_ray_       |
+              | RayWeightRegistry |< - - - - - - - - - - -|    registry(step)               |
+              | (Detached Actor)  |     2. ray.get(ref)   |  - Pulls full model from Plasma,|
+              +-------------------+        from Plasma    |    slices TP shard, .to("tpu")  |
+                        ^                                 +---------------------------------+
+                        |                                                  ^
+          [Ray Controller: CheckpointEngineManager]                        |
+          Calls replica.server_handle.collective_rpc(                      |
+              "load_weights_from_ray_registry", args=(step,) --------------+
+          )
+    """
 
     def __init__(self, bucket_size: int = 0, is_master: bool = False, **kwargs: Any) -> None:
         self.is_master = is_master
@@ -576,7 +605,15 @@ def apply_tpu_checkpoint_engine_hooks() -> None:
                 worker_cls = getattr(mod, cls_name, None)
                 if worker_cls is not None and not hasattr(worker_cls, "load_weights_from_ray_registry"):
                     worker_cls.load_weights_from_ray_registry = load_weights_from_ray_registry
-            except ImportError:
+            except ImportError as e:
+                missing_pkg = getattr(e, "name", None) or mod_path
+                logger.debug(
+                    "Skipping load_weights_from_ray_registry hook for %s.%s: package %r caused ImportError (%s)",
+                    mod_path,
+                    cls_name,
+                    missing_pkg,
+                    e,
+                )
                 continue
     except Exception as e:
         logger.debug("Failed to attach load_weights_from_ray_registry to TPUWorker: %s", e)
