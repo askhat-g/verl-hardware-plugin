@@ -1,7 +1,12 @@
 # Copyright (c) 2026 Google LLC. All rights reserved.
 # Licensed under the Apache License, Version 2.0.
 
-"""Lightweight CPU-only Ray actor registry for tracking model weight checkpoint ObjectRefs."""
+"""Lightweight CPU-only Ray actor registry for tracking model weight checkpoint ObjectRefs.
+
+On TPU, trainer and rollout slices hold exclusive ``libtpu`` locks and cannot share a collective
+communicator, so trainer rank 0 stores weights in Ray Plasma and registers the ``ObjectRef`` here
+for rollout ``TPUWorker`` processes to fetch by training step.
+"""
 
 from typing import Any
 
