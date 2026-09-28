@@ -6,12 +6,22 @@
 import os
 from unittest import mock
 
+import pytest
 import torch
+from tensordict import TensorDict
+
+from verl_hardware_plugin.engines.tpu_utils import (
+    TPUVarlenAttention,
+    bucket_length,
+    get_tpu_seq_bucket_size,
+    pad_packed_inputs_for_tpu,
+    replace_varlen_attention_with_tpu_attention,
+    unwrap_metadata,
+)
+from verl_hardware_plugin.platforms.platform_tpu import PlatformTPU, resolve_tpu_topology_bounds
 
 
 def test_bucket_length_and_env_override():
-    from verl_hardware_plugin.engines.tpu_utils import bucket_length, get_tpu_seq_bucket_size
-
     assert get_tpu_seq_bucket_size() == 256
     assert bucket_length(1) == 256
     assert bucket_length(256) == 256
@@ -24,18 +34,12 @@ def test_bucket_length_and_env_override():
 
 
 def test_unwrap_metadata():
-    from verl_hardware_plugin.engines.tpu_utils import unwrap_metadata
-
     assert unwrap_metadata([torch.tensor(3.5)]) == 3.5
     assert unwrap_metadata((True, False)) is True
     assert unwrap_metadata("flex") == "flex"
 
 
 def test_pad_packed_inputs_for_tpu_builds_4d_document_causal_mask():
-    from tensordict import TensorDict
-
-    from verl_hardware_plugin.engines.tpu_utils import pad_packed_inputs_for_tpu
-
     # Two packed documents of lengths 3 and 2 -> orig_seq_len = 5
     input_ids = torch.nested.nested_tensor(
         [torch.tensor([10, 11, 12]), torch.tensor([20, 21])],
@@ -69,11 +73,6 @@ def test_pad_packed_inputs_for_tpu_builds_4d_document_causal_mask():
 
 
 def test_replace_varlen_attention_with_tpu_attention():
-    from verl_hardware_plugin.engines.tpu_utils import (
-        TPUVarlenAttention,
-        replace_varlen_attention_with_tpu_attention,
-    )
-
     class _DummyAttnBlock(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -88,8 +87,6 @@ def test_replace_varlen_attention_with_tpu_attention():
 
 
 def test_resolve_tpu_topology_bounds_multi_host():
-    from verl_hardware_plugin.platforms.platform_tpu import resolve_tpu_topology_bounds
-
     # v6e-8 across two hosts: the mesh spans hosts, so the bounds are the host bounds.
     topology, host_bounds, chips_per_host_bounds, chips_per_host = resolve_tpu_topology_bounds(
         total_chips=8, num_nodes=2
@@ -101,8 +98,6 @@ def test_resolve_tpu_topology_bounds_multi_host():
 
 
 def test_resolve_tpu_topology_bounds_single_host():
-    from verl_hardware_plugin.platforms.platform_tpu import resolve_tpu_topology_bounds
-
     # A 4-chip slice on one host is addressed inside the host, not across hosts.
     assert resolve_tpu_topology_bounds(total_chips=4, num_nodes=1) == ("2,2,1", "1,1,1", "2,2,1", "4")
     # Same chip count spread over two hosts cannot use in-host bounds.
@@ -110,8 +105,6 @@ def test_resolve_tpu_topology_bounds_single_host():
 
 
 def test_resolve_tpu_topology_bounds_pod_type_and_env_override():
-    from verl_hardware_plugin.platforms.platform_tpu import resolve_tpu_topology_bounds
-
     # Pod type wins over the chip count: this job holds 8 of a 16-chip slice.
     assert resolve_tpu_topology_bounds(total_chips=8, num_nodes=2, pod_type="v6e-16")[0] == "4,4,1"
 
@@ -124,10 +117,15 @@ def test_resolve_tpu_topology_bounds_pod_type_and_env_override():
 
 
 def test_resolve_tpu_topology_bounds_raises_on_unknown_slice():
-    import pytest
-
-    from verl_hardware_plugin.platforms.platform_tpu import resolve_tpu_topology_bounds
-
     # Guessing "1,1,1" here would train on a subset of the slice without any error.
     with pytest.raises(ValueError, match="TORCH_TPU_TOPOLOGY"):
         resolve_tpu_topology_bounds(total_chips=6, num_nodes=2)
+
+
+def test_platform_tpu_ray_init_kwargs():
+    platform = PlatformTPU()
+    assert platform.get_ray_init_kwargs() == {
+        "runtime_env": {
+            "env_vars": {"VERL_PLATFORM": "tpu"},
+        }
+    }

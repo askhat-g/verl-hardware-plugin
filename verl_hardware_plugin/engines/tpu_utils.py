@@ -20,6 +20,19 @@ from tensordict import TensorDict
 
 from verl.utils import tensordict_utils as tu
 
+try:
+    from torch_tpu._internal.sync import synchronize as _tpu_synchronize
+except ImportError:
+    _tpu_synchronize = None  # type: ignore[assignment]
+
+try:
+    from torchtitan.components.optimizer import OptimizersContainer
+
+    import verl.workers.engine.torchtitan.transformer_impl as tt_impl
+except ImportError:
+    OptimizersContainer = None  # type: ignore[assignment,misc]
+    tt_impl = None  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -60,13 +73,9 @@ def synchronize_tpu_loss(loss: torch.Tensor) -> None:
     """Materialize the forward graph loss without blocking to split XLA forward and backward compilation passes."""
     if loss.device.type != "tpu":
         return
-    try:
-        from torch_tpu._internal.sync import synchronize
-
-        synchronize(loss, wait=False)
+    if _tpu_synchronize is not None:
+        _tpu_synchronize(loss, wait=False)
         return
-    except ImportError:
-        pass
     tpu_mod = getattr(torch, "tpu", None)
     if tpu_mod is not None and hasattr(tpu_mod, "synchronize"):
         try:
@@ -87,9 +96,9 @@ def compute_global_batch_num_tokens(data: TensorDict, dp_group: Any, tp_size: in
 @contextmanager
 def tpu_torchtitan_config_overrides():
     """Force the four TorchTitan config values that differ on TPU during ``TorchTitanEngine.__init__``."""
-    from torchtitan.components.optimizer import OptimizersContainer
-
-    import verl.workers.engine.torchtitan.transformer_impl as tt_impl
+    if OptimizersContainer is None or tt_impl is None:
+        yield
+        return
 
     forced: list[tuple[Any, str, Any]] = [
         (OptimizersContainer, "Config", {"implementation": "foreach"}),

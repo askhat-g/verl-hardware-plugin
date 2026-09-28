@@ -52,6 +52,13 @@ from verl_hardware_plugin.engines.tpu_utils import (
     unwrap_metadata,
 )
 
+try:
+    from torchtitan.distributed import utils as dist_utils
+    from torchtitan.distributed.context_parallel import prepare_context_parallel_input
+except ImportError:
+    dist_utils = None  # type: ignore[assignment]
+    prepare_context_parallel_input = None  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -127,8 +134,6 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanEngineWithLMHead):
 
     def optimizer_step(self):
         """Clip gradients using the per-tensor norm path (``foreach=False``) and step the optimizer."""
-        from torchtitan.distributed import utils as dist_utils
-
         grad_norm = dist_utils.clip_grad_norm_(
             [p for m in self.module for p in m.parameters()],
             self.config.training.max_norm,
@@ -200,8 +205,6 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanEngineWithLMHead):
         extra_kwargs = {"attention_masks": attention_mask}
 
         if self.parallel_dims.cp_enabled:
-            from torchtitan.distributed.context_parallel import prepare_context_parallel_input
-
             input_ids, labels, extra_kwargs = prepare_context_parallel_input(
                 input_ids,
                 labels,
