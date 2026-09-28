@@ -26,24 +26,10 @@ from verl.plugin.platform.platform_manager import PlatformRegistry
 
 logger = logging.getLogger(__name__)
 
-
-def _ensure_torch_tpu() -> bool:
-    """Try to import torch_tpu, which registers the ``tpu_dist`` distributed backend.
-
-    Returns True if the TPU runtime is usable after the attempt.
-    """
-    if hasattr(torch, "tpu"):
-        return True
-    try:
-        import torch_tpu  # noqa: F401
-
-        return hasattr(torch, "tpu")
-    except Exception as e:
-        logger.debug("The current machine has no torch.tpu, because: %s", e)
-    return False
-
-
-_ensure_torch_tpu()  # Attempt at module load time so availability checks are faster later
+try:
+    import torch_tpu  # noqa: F401
+except Exception as e:
+    logger.debug("The current machine has no torch.tpu, because: %s", e)
 
 # Base port for the TPU distributed slice builder mesh. Each local rank takes ``base + local_rank``.
 TPU_PROCESS_BASE_PORT = 8471
@@ -297,35 +283,6 @@ class TPUDeviceModuleProxy:
                 logger.warning(f"Failed to clear TPU cache: {e}")
 
 
-def patch_ray_worker() -> None:
-    """Ray ``worker_process_setup_hook`` for GKE TPU pods.
-
-    Runs once in every Ray worker process before any task. It does two things:
-
-    1. Pins ``VERL_PLATFORM=tpu`` so a worker that did not inherit the driver's environment still
-       resolves the TPU platform.
-    2. Makes Raylet's accelerator-id lookup non-fatal. Each GKE pod is given only its own slice of
-       the host's TPU chips, so a host-level index lookup can run off the end of the visible list
-       and raise ``IndexError``. Returning an empty list is correct here: verl assigns chips itself
-       via ``TPU_VISIBLE_CHIPS``.
-    """
-    os.environ["VERL_PLATFORM"] = "tpu"
-
-    try:
-        original_func = ray._private.worker.Worker.get_accelerator_ids_for_accelerator_resource
-
-        def patched_func(self, resource_name, resource_regex):
-            try:
-                return original_func(self, resource_name, resource_regex)
-            except IndexError as e:
-                logger.debug("Intercepted Ray accelerator lookup IndexError for resource %r: %s", resource_name, e)
-                return []
-
-        ray._private.worker.Worker.get_accelerator_ids_for_accelerator_resource = patched_func
-    except Exception as e:
-        logger.warning(f"Failed to apply Ray worker accelerator patch: {e}")
-
-
 @PlatformRegistry.register(platform="tpu")
 class PlatformTPU(PlatformBase):
     """Platform backend for Google TPUs.
@@ -459,10 +416,9 @@ class PlatformTPU(PlatformBase):
         return False
 
     def get_ray_init_kwargs(self) -> dict[str, Any]:
-        """Install the GKE TPU worker setup hook and pin the platform inside Ray workers."""
+        """Pin the TPU platform inside Ray workers."""
         return {
             "runtime_env": {
-                "worker_process_setup_hook": patch_ray_worker,
                 "env_vars": {"VERL_PLATFORM": "tpu"},
             }
         }

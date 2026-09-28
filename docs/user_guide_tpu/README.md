@@ -20,16 +20,21 @@ verl_hardware_plugin/
 ```
 
 ```text
+scripts/
+└── run_sft_qwen3_0_6b_tpu.sh         # SFT launch script for Qwen3-0.6B on TPU v6e
+```
+
+```text
 user_guide_tpu/
 ├── README.md                         # This file
 ├── install_guidance.md               # Installation and environment setup
-└── quick_start.md                    # Selecting and verifying the platform
+└── quick_start.md                    # Selecting the platform and running SFT
 ```
 
 ## Getting Started
 
 - [Installation Guide](./install_guidance.md) — prerequisites and environment setup
-- [Quick Start](./quick_start.md) — select the TPU platform and verify it resolves
+- [Quick Start](./quick_start.md) — select the TPU platform, verify registration, and run SFT
 
 ## Platform Summary
 
@@ -54,9 +59,9 @@ The two variables serve different purposes and must not be merged.
 
 | Generation | HBM per chip | Topologies with a built-in mapping |
 |------------|--------------|------------------------------------|
-| v6e | 32 GB | `v6e-4`, `v6e-8`, `v6e-32` |
+| v6e | 32 GB | `v6e-4`, `v6e-8`, `v6e-16`, `v6e-32` |
 
-v6e is the only generation this plugin supports. When the generation cannot be determined from
+v6e is the primary generation this plugin targets. When the generation cannot be determined from
 Ray node labels or environment variables, the platform falls back to the v6e HBM figure.
 
 ## Related Documentation
