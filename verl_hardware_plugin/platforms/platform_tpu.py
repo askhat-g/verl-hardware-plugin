@@ -339,6 +339,7 @@ class PlatformTPU(PlatformBase):
         super().__init__()
         original_tpu = getattr(torch, "tpu", DummyTpuDeviceModule())
         self._device_module = TPUDeviceModuleProxy(original_tpu)
+        self._assigned_slices: set[str] = set()
 
     @property
     def vendor_name(self) -> str:
@@ -467,57 +468,85 @@ class PlatformTPU(PlatformBase):
             }
         }
 
-    def auto_assign_accelerator_type(self, name_prefix: str, accelerator_type: Optional[str]) -> Optional[str]:
-        """Pin a resource pool to a TPU slice on multi-slice clusters.
+    def auto_assign_accelerator_type(
+        self,
+        name_prefix: str,
+        accelerator_type: Optional[str] = None,
+        process_on_nodes: Optional[list[int]] = None,
+    ) -> Optional[str]:
+        """Pin a resource pool to a matching TPU slice on multi-slice clusters.
 
-        Called unconditionally from ``verl.single_controller.ray.base.RayResourcePool.__init__``
-        whenever ``device_name == "tpu"``; ``PlatformBase`` does not declare it, so the TPU
-        platform has to provide it.
-
-        A KubeRay TPU cluster advertises one ``tpu-group-<n>`` custom resource per slice. Without
-        an affinity label a pool can straddle two slices, which the TPU mesh cannot span, so pin
-        it to the first slice.
+        Matches a KubeRay TPU slice resource (``ray.io/tpu-slice-name`` or ``tpu-group-*``)
+        whose physical node count and total TPU capacity match ``process_on_nodes`` and
+        whose TPU chips are currently available.
         """
         if accelerator_type is not None:
             return accelerator_type
 
         try:
             if ray.is_initialized():
-                tpu_slices = set()
+                resource_name = self.ray_resource_name()
+                slices_nodes: dict[str, list[dict]] = {}
                 for node in ray.nodes():
-                    if node.get("Alive"):
-                        for res in node.get("Resources", {}):
-                            if res.startswith("tpu-group-"):
-                                tpu_slices.add(res)
-                slices = sorted(tpu_slices)
-                if slices:
-                    return slices[0]
+                    if not node.get("Alive"):
+                        continue
+                    resources = node.get("Resources", {})
+                    labels = node.get("Labels", {})
+                    slice_name = labels.get("ray.io/tpu-slice-name")
+                    if not slice_name or slice_name not in resources:
+                        slice_name = next((r for r in resources if r.startswith("tpu-group-")), None)
+                    if slice_name:
+                        slices_nodes.setdefault(slice_name, []).append(node)
+
+                if not slices_nodes:
+                    return accelerator_type
+
+                sorted_slices = sorted(slices_nodes.keys())
+                if not process_on_nodes:
+                    return sorted_slices[0]
+
+                req_nodes = len(process_on_nodes)
+                req_tpus = sum(process_on_nodes)
+
+                try:
+                    avail_per_node = ray._private.state.available_resources_per_node()
+                except Exception:
+                    avail_per_node = {}
+
+                exact_available = []
+                exact_any = []
+                subslice_available = []
+
+                for slice_name in sorted_slices:
+                    nodes = slices_nodes[slice_name]
+                    total_nodes = len(nodes)
+                    total_tpus = sum(int(n.get("Resources", {}).get(resource_name, 0)) for n in nodes)
+                    avail_tpus = (
+                        sum(int(avail_per_node.get(n.get("NodeID"), {}).get(resource_name, 0)) for n in nodes)
+                        if avail_per_node
+                        else total_tpus
+                    )
+
+                    if total_nodes == req_nodes and total_tpus == req_tpus:
+                        exact_any.append(slice_name)
+                        if avail_tpus >= req_tpus and slice_name not in self._assigned_slices:
+                            exact_available.append(slice_name)
+                    elif req_nodes == 1 and total_nodes == 1 and total_tpus >= req_tpus:
+                        if avail_tpus >= req_tpus and slice_name not in self._assigned_slices:
+                            subslice_available.append(slice_name)
+
+                chosen = (
+                    (exact_available[0] if exact_available else None)
+                    or (subslice_available[0] if subslice_available else None)
+                    or (exact_any[0] if exact_any else None)
+                    or sorted_slices[0]
+                )
+                self._assigned_slices.add(chosen)
+                return chosen
         except Exception as e:
             logger.debug("Could not auto-assign a TPU slice for %r: %s", name_prefix, e)
 
         return accelerator_type
-
-    def configure_placement_group_bundle(
-        self,
-        bundle: dict,
-        use_gpu: bool,
-        device_name: str,
-        name_prefix: str,
-        accelerator_type: Optional[str] = None,
-    ) -> None:
-        """Shape a placement-group bundle for GKE TPU.
-
-        Called unconditionally from ``verl.single_controller.ray.base.RayResourcePool``
-        whenever ``device_name == "tpu"``; ``PlatformBase`` does not declare it, so the TPU
-        platform has to provide it.
-
-        The slice affinity is requested as a fractional amount so it acts as a label rather
-        than a real reservation.
-        """
-        if use_gpu:
-            bundle[device_name] = 1
-        if accelerator_type is not None:
-            bundle[accelerator_type] = 1e-4
 
     def get_tpu_env_vars(
         self,
@@ -579,8 +608,16 @@ class PlatformTPU(PlatformBase):
             "TPU_VISIBLE_CHIPS": str(local_rank),
         }
 
-        # Derive the mesh from the pod type Ray reports, falling back to the chip count.
-        tpu_nodes = [node for node in ray.nodes() if "TPU" in node.get("Resources", {}) and node.get("Alive")]
+        # Derive the mesh from the pod type of the nodes assigned to this placement group.
+        tpu_nodes = [
+            node
+            for node in ray.nodes()
+            if "TPU" in node.get("Resources", {})
+            and node.get("Alive")
+            and node.get("NodeManagerAddress") in unique_hostnames
+        ]
+        if not tpu_nodes:
+            tpu_nodes = [node for node in ray.nodes() if "TPU" in node.get("Resources", {}) and node.get("Alive")]
         tpu_type = tpu_nodes[0].get("Labels", {}).get("ray.io/tpu-pod-type", "") if tpu_nodes else ""
 
         topology, host_bounds, chips_per_host_bounds, chips_per_host = resolve_tpu_topology_bounds(

@@ -131,3 +131,61 @@ def test_resolve_tpu_topology_bounds_raises_on_unknown_slice():
     # Guessing "1,1,1" here would train on a subset of the slice without any error.
     with pytest.raises(ValueError, match="TORCH_TPU_TOPOLOGY"):
         resolve_tpu_topology_bounds(total_chips=6, num_nodes=2)
+
+
+def test_auto_assign_accelerator_type_matches_slice_size_and_availability():
+    import ray
+
+    from verl_hardware_plugin.platforms.platform_tpu import PlatformTPU
+
+    # Cluster with a 16-chip slice named "tpu-group-0" (alphabetically first!)
+    # and two 8-chip slices named "tpu-group-1" and "custom-slice-2".
+    fake_nodes = [
+        *[
+            {
+                "NodeID": f"n16-{i}",
+                "Alive": True,
+                "Resources": {"TPU": 4.0, "tpu-group-0": 1.0},
+                "Labels": {"ray.io/tpu-slice-name": "tpu-group-0", "ray.io/tpu-pod-type": "v6e-16"},
+            }
+            for i in range(4)
+        ],
+        *[
+            {
+                "NodeID": f"n8a-{i}",
+                "Alive": True,
+                "Resources": {"TPU": 4.0, "tpu-group-1": 1.0},
+                "Labels": {"ray.io/tpu-slice-name": "tpu-group-1", "ray.io/tpu-pod-type": "v6e-8"},
+            }
+            for i in range(2)
+        ],
+        *[
+            {
+                "NodeID": f"n8b-{i}",
+                "Alive": True,
+                "Resources": {"TPU": 4.0, "custom-slice-2": 1.0},
+                "Labels": {"ray.io/tpu-slice-name": "custom-slice-2", "ray.io/tpu-pod-type": "v6e-8"},
+            }
+            for i in range(2)
+        ],
+    ]
+    avail = {n["NodeID"]: {"TPU": 4.0} for n in fake_nodes}
+
+    platform = PlatformTPU()
+    with (
+        mock.patch.object(ray, "is_initialized", return_value=True),
+        mock.patch.object(ray, "nodes", return_value=fake_nodes),
+        mock.patch.object(ray._private.state, "available_resources_per_node", return_value=avail, create=True),
+    ):
+        # 1. An 8-TPU job ([4, 4]) skips "tpu-group-0" (16 chips) and picks "custom-slice-2" / "tpu-group-1"
+        slice_8_first = platform.auto_assign_accelerator_type("actor", None, [4, 4])
+        assert slice_8_first == "custom-slice-2"
+
+        # 2. A second 8-TPU pool ([4, 4]) picks the remaining 8-TPU slice ("tpu-group-1")
+        slice_8_second = platform.auto_assign_accelerator_type("rollout", None, [4, 4])
+        assert slice_8_second == "tpu-group-1"
+
+        # 3. A 16-TPU pool ([4, 4, 4, 4]) picks "tpu-group-0"
+        slice_16 = platform.auto_assign_accelerator_type("trainer16", None, [4, 4, 4, 4])
+        assert slice_16 == "tpu-group-0"
+
