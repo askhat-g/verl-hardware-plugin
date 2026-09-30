@@ -339,7 +339,6 @@ class PlatformTPU(PlatformBase):
         super().__init__()
         original_tpu = getattr(torch, "tpu", DummyTpuDeviceModule())
         self._device_module = TPUDeviceModuleProxy(original_tpu)
-        self._assigned_slices: set[str] = set()
 
     @property
     def vendor_name(self) -> str:
@@ -468,85 +467,110 @@ class PlatformTPU(PlatformBase):
             }
         }
 
-    def auto_assign_accelerator_type(
+    def get_placement_groups(
         self,
-        name_prefix: str,
+        process_on_nodes: list[int],
+        bundle: dict[str, Any],
+        strategy: str,
+        pg_name_prefix: str,
+        lifetime: Optional[str],
         accelerator_type: Optional[str] = None,
-        process_on_nodes: Optional[list[int]] = None,
-    ) -> Optional[str]:
-        """Pin a resource pool to a matching TPU slice on multi-slice clusters.
+    ) -> list:
+        """Reserve a TPU slice via Ray's SlicePlacementGroup and return one PlacementGroup per host."""
+        from ray.util.placement_group import placement_group, remove_placement_group
+        from ray.util.tpu import SlicePlacementGroup, get_tpu_version_from_type
 
-        Matches a KubeRay TPU slice resource (``ray.io/tpu-slice-name`` or ``tpu-group-*``)
-        whose physical node count and total TPU capacity match ``process_on_nodes`` and
-        whose TPU chips are currently available.
-        """
-        if accelerator_type is not None:
-            return accelerator_type
+        total_chips = sum(process_on_nodes)
+        num_hosts = len(process_on_nodes)
+        chips_per_vm = process_on_nodes[0]
 
-        try:
-            if ray.is_initialized():
-                resource_name = self.ray_resource_name()
-                slices_nodes: dict[str, list[dict]] = {}
-                for node in ray.nodes():
-                    if not node.get("Alive"):
-                        continue
-                    resources = node.get("Resources", {})
-                    labels = node.get("Labels", {})
-                    slice_name = labels.get("ray.io/tpu-slice-name")
-                    if not slice_name or slice_name not in resources:
-                        slice_name = next((r for r in resources if r.startswith("tpu-group-")), None)
-                    if slice_name:
-                        slices_nodes.setdefault(slice_name, []).append(node)
+        topology = None
+        accelerator_version = None
+        has_worker_id_label = False
 
-                if not slices_nodes:
-                    return accelerator_type
+        if ray.is_initialized():
+            slices_nodes: dict[str, list[dict]] = {}
+            tpu_nodes = []
+            for node in ray.nodes():
+                if not node.get("Alive") or "TPU" not in node.get("Resources", {}):
+                    continue
+                tpu_nodes.append(node)
+                slice_name = node.get("Labels", {}).get("ray.io/tpu-slice-name")
+                if slice_name:
+                    slices_nodes.setdefault(slice_name, []).append(node)
 
-                sorted_slices = sorted(slices_nodes.keys())
-                if not process_on_nodes:
-                    return sorted_slices[0]
+            matching_nodes = []
+            for nodes in slices_nodes.values():
+                slice_chips = sum(int(n.get("Resources", {}).get("TPU", 0)) for n in nodes)
+                if len(nodes) == num_hosts and slice_chips == total_chips:
+                    matching_nodes = nodes
+                    break
+            if not matching_nodes:
+                matching_nodes = tpu_nodes
 
-                req_nodes = len(process_on_nodes)
-                req_tpus = sum(process_on_nodes)
-
-                try:
-                    avail_per_node = ray._private.state.available_resources_per_node()
-                except Exception:
-                    avail_per_node = {}
-
-                exact_available = []
-                exact_any = []
-                subslice_available = []
-
-                for slice_name in sorted_slices:
-                    nodes = slices_nodes[slice_name]
-                    total_nodes = len(nodes)
-                    total_tpus = sum(int(n.get("Resources", {}).get(resource_name, 0)) for n in nodes)
-                    avail_tpus = (
-                        sum(int(avail_per_node.get(n.get("NodeID"), {}).get(resource_name, 0)) for n in nodes)
-                        if avail_per_node
-                        else total_tpus
-                    )
-
-                    if total_nodes == req_nodes and total_tpus == req_tpus:
-                        exact_any.append(slice_name)
-                        if avail_tpus >= req_tpus and slice_name not in self._assigned_slices:
-                            exact_available.append(slice_name)
-                    elif req_nodes == 1 and total_nodes == 1 and total_tpus >= req_tpus:
-                        if avail_tpus >= req_tpus and slice_name not in self._assigned_slices:
-                            subslice_available.append(slice_name)
-
-                chosen = (
-                    (exact_available[0] if exact_available else None)
-                    or (subslice_available[0] if subslice_available else None)
-                    or (exact_any[0] if exact_any else None)
-                    or sorted_slices[0]
+            if matching_nodes:
+                labels = matching_nodes[0].get("Labels", {})
+                if (
+                    len(matching_nodes) == num_hosts
+                    and sum(int(n.get("Resources", {}).get("TPU", 0)) for n in matching_nodes) == total_chips
+                ):
+                    topology = labels.get("ray.io/tpu-topology")
+                has_worker_id_label = all("ray.io/tpu-worker-id" in n.get("Labels", {}) for n in matching_nodes)
+                raw_type = (
+                    accelerator_type or labels.get("ray.io/accelerator-type") or labels.get("ray.io/tpu-pod-type")
                 )
-                self._assigned_slices.add(chosen)
-                return chosen
-        except Exception as e:
-            logger.debug("Could not auto-assign a TPU slice for %r: %s", name_prefix, e)
+                if raw_type:
+                    candidate = raw_type.split("-")[0] if not raw_type.lower().startswith("tpu") else raw_type
+                    try:
+                        accelerator_version = get_tpu_version_from_type(candidate)
+                    except ValueError:
+                        pass
 
-        return accelerator_type
+        if not topology:
+            topology = DEFAULT_TPU_TOPOLOGY_MAP.get(total_chips, "").replace(",1", "").replace(",", "x")
+            if not topology:
+                raise ValueError(f"Unsupported TPU chip count {total_chips} for SlicePlacementGroup.")
+
+        if not accelerator_version:
+            accelerator_version = get_tpu_version_from_type(accelerator_type) if accelerator_type else "v6e"
+
+        # Explicitly pass chips_per_vm=process_on_nodes[0] to resolve ambiguous topologies like v6e 2x4
+        # (2 hosts x 4 chips on GKE vs 1 host x 8 chips in Ray's default lookup).
+        tpu_strategy = "PACK" if (strategy == "STRICT_PACK" and num_hosts > 1) else strategy
+        slice_pg = SlicePlacementGroup(
+            topology=topology,
+            accelerator_version=accelerator_version,
+            resources_per_bundle=bundle,
+            strategy=tpu_strategy,
+            name=pg_name_prefix + "0",
+            lifetime=lifetime,
+            chips_per_vm=chips_per_vm,
+        )
+        try:
+            if num_hosts == 1:
+                pgs = [slice_pg.placement_group]
+            else:
+                slice_label = dict(slice_pg.bundle_label_selector[0]) if slice_pg.bundle_label_selector else {}
+                remove_placement_group(slice_pg.placement_group)
+                pgs = []
+                for idx, process_count in enumerate(process_on_nodes):
+                    host_labels = dict(slice_label)
+                    if has_worker_id_label:
+                        host_labels["ray.io/tpu-worker-id"] = str(idx)
+                    label_selector = [host_labels.copy() for _ in range(process_count)] if host_labels else None
+                    pgs.append(
+                        placement_group(
+                            bundles=[bundle.copy() for _ in range(process_count)],
+                            strategy=strategy,
+                            name=pg_name_prefix + str(idx),
+                            lifetime=lifetime,
+                            bundle_label_selector=label_selector,
+                        )
+                    )
+            ray.get([pg.ready() for pg in pgs])
+            return pgs
+        finally:
+            slice_pg.release_head_pgs()
 
     def get_tpu_env_vars(
         self,

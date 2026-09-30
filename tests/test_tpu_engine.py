@@ -133,59 +133,108 @@ def test_resolve_tpu_topology_bounds_raises_on_unknown_slice():
         resolve_tpu_topology_bounds(total_chips=6, num_nodes=2)
 
 
-def test_auto_assign_accelerator_type_matches_slice_size_and_availability():
+def test_get_placement_groups_uses_slice_placement_group_for_2x4_pool():
+    import sys
+    import types
+
     import ray
 
     from verl_hardware_plugin.platforms.platform_tpu import PlatformTPU
 
-    # Cluster with a 16-chip slice named "tpu-group-0" (alphabetically first!)
-    # and two 8-chip slices named "tpu-group-1" and "custom-slice-2".
     fake_nodes = [
         *[
             {
                 "NodeID": f"n16-{i}",
                 "Alive": True,
-                "Resources": {"TPU": 4.0, "tpu-group-0": 1.0},
-                "Labels": {"ray.io/tpu-slice-name": "tpu-group-0", "ray.io/tpu-pod-type": "v6e-16"},
+                "Resources": {"TPU": 4.0},
+                "Labels": {
+                    "ray.io/tpu-slice-name": "tpu-group-trainer-0",
+                    "ray.io/tpu-topology": "4x4",
+                    "ray.io/accelerator-type": "TPU-V6E",
+                    "ray.io/tpu-worker-id": str(i),
+                },
             }
             for i in range(4)
         ],
         *[
             {
-                "NodeID": f"n8a-{i}",
+                "NodeID": f"n8-{i}",
                 "Alive": True,
-                "Resources": {"TPU": 4.0, "tpu-group-1": 1.0},
-                "Labels": {"ray.io/tpu-slice-name": "tpu-group-1", "ray.io/tpu-pod-type": "v6e-8"},
-            }
-            for i in range(2)
-        ],
-        *[
-            {
-                "NodeID": f"n8b-{i}",
-                "Alive": True,
-                "Resources": {"TPU": 4.0, "custom-slice-2": 1.0},
-                "Labels": {"ray.io/tpu-slice-name": "custom-slice-2", "ray.io/tpu-pod-type": "v6e-8"},
+                "Resources": {"TPU": 4.0},
+                "Labels": {
+                    "ray.io/tpu-slice-name": "tpu-group-0",
+                    "ray.io/tpu-topology": "2x4",
+                    "ray.io/accelerator-type": "TPU-V6E",
+                    "ray.io/tpu-worker-id": str(i),
+                },
             }
             for i in range(2)
         ],
     ]
-    avail = {n["NodeID"]: {"TPU": 4.0} for n in fake_nodes}
+
+    captured = {"host_pgs": [], "removed": []}
+
+    class _FakePG:
+        def __init__(self, name="slice", bundles=None, strategy=None, lifetime=None, bundle_label_selector=None):
+            self.name = name
+            self.bundles = bundles or []
+            self.bundle_count = len(self.bundles)
+            self.strategy = strategy
+            self.lifetime = lifetime
+            self.bundle_label_selector = bundle_label_selector
+
+        def ready(self):
+            return None
+
+    class _FakeSlicePlacementGroup:
+        def __init__(self, **kwargs):
+            captured["slice_kwargs"] = kwargs
+            self.placement_group = _FakePG(name="spg_worker")
+            self.bundle_label_selector = [{"ray.io/tpu-slice-name": "tpu-group-0"}] * 8
+
+        def release_head_pgs(self):
+            captured["released_head"] = True
+
+    fake_tpu_mod = types.ModuleType("ray.util.tpu")
+    fake_tpu_mod.SlicePlacementGroup = _FakeSlicePlacementGroup
+    fake_tpu_mod.get_tpu_version_from_type = lambda t: t.lower().replace("tpu-", "")
+
+    def _fake_placement_group(bundles, strategy=None, name=None, lifetime=None, bundle_label_selector=None):
+        pg = _FakePG(
+            name=name,
+            bundles=bundles,
+            strategy=strategy,
+            lifetime=lifetime,
+            bundle_label_selector=bundle_label_selector,
+        )
+        captured["host_pgs"].append(pg)
+        return pg
 
     platform = PlatformTPU()
     with (
         mock.patch.object(ray, "is_initialized", return_value=True),
         mock.patch.object(ray, "nodes", return_value=fake_nodes),
-        mock.patch.object(ray._private.state, "available_resources_per_node", return_value=avail, create=True),
+        mock.patch.object(ray, "get", return_value=None),
+        mock.patch.dict(sys.modules, {"ray.util.tpu": fake_tpu_mod}),
+        mock.patch("ray.util.placement_group.placement_group", side_effect=_fake_placement_group),
+        mock.patch("ray.util.placement_group.remove_placement_group", side_effect=captured["removed"].append),
     ):
-        # 1. An 8-TPU job ([4, 4]) skips "tpu-group-0" (16 chips) and picks "custom-slice-2" / "tpu-group-1"
-        slice_8_first = platform.auto_assign_accelerator_type("actor", None, [4, 4])
-        assert slice_8_first == "custom-slice-2"
+        pgs = platform.get_placement_groups(
+            process_on_nodes=[4, 4],
+            bundle={"CPU": 1, "TPU": 1},
+            strategy="STRICT_PACK",
+            pg_name_prefix="sft_pool:",
+            lifetime=None,
+        )
 
-        # 2. A second 8-TPU pool ([4, 4]) picks the remaining 8-TPU slice ("tpu-group-1")
-        slice_8_second = platform.auto_assign_accelerator_type("rollout", None, [4, 4])
-        assert slice_8_second == "tpu-group-1"
-
-        # 3. A 16-TPU pool ([4, 4, 4, 4]) picks "tpu-group-0"
-        slice_16 = platform.auto_assign_accelerator_type("trainer16", None, [4, 4, 4, 4])
-        assert slice_16 == "tpu-group-0"
-
+    assert len(pgs) == 2
+    assert captured["slice_kwargs"]["topology"] == "2x4"
+    assert captured["slice_kwargs"]["accelerator_version"] == "v6e"
+    assert captured["slice_kwargs"]["chips_per_vm"] == 4
+    assert captured["slice_kwargs"]["strategy"] == "PACK"
+    assert len(captured["removed"]) == 1
+    assert captured["released_head"] is True
+    assert pgs[0].bundle_count == 4
+    assert pgs[0].bundle_label_selector == [{"ray.io/tpu-slice-name": "tpu-group-0", "ray.io/tpu-worker-id": "0"}] * 4
+    assert pgs[1].bundle_count == 4
+    assert pgs[1].bundle_label_selector == [{"ray.io/tpu-slice-name": "tpu-group-0", "ray.io/tpu-worker-id": "1"}] * 4
