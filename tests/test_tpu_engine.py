@@ -131,3 +131,110 @@ def test_resolve_tpu_topology_bounds_raises_on_unknown_slice():
     # Guessing "1,1,1" here would train on a subset of the slice without any error.
     with pytest.raises(ValueError, match="TORCH_TPU_TOPOLOGY"):
         resolve_tpu_topology_bounds(total_chips=6, num_nodes=2)
+
+
+def test_get_placement_groups_uses_slice_placement_group_for_2x4_pool():
+    import sys
+    import types
+
+    import ray
+
+    from verl_hardware_plugin.platforms.platform_tpu import PlatformTPU
+
+    fake_nodes = [
+        *[
+            {
+                "NodeID": f"n16-{i}",
+                "Alive": True,
+                "Resources": {"TPU": 4.0},
+                "Labels": {
+                    "ray.io/tpu-slice-name": "tpu-group-trainer-0",
+                    "ray.io/tpu-topology": "4x4",
+                    "ray.io/accelerator-type": "TPU-V6E",
+                    "ray.io/tpu-worker-id": str(i),
+                },
+            }
+            for i in range(4)
+        ],
+        *[
+            {
+                "NodeID": f"n8-{i}",
+                "Alive": True,
+                "Resources": {"TPU": 4.0},
+                "Labels": {
+                    "ray.io/tpu-slice-name": "tpu-group-0",
+                    "ray.io/tpu-topology": "2x4",
+                    "ray.io/accelerator-type": "TPU-V6E",
+                    "ray.io/tpu-worker-id": str(i),
+                },
+            }
+            for i in range(2)
+        ],
+    ]
+
+    captured = {"host_pgs": [], "removed": []}
+
+    class _FakePG:
+        def __init__(self, name="slice", bundles=None, strategy=None, lifetime=None, bundle_label_selector=None):
+            self.name = name
+            self.bundles = bundles or []
+            self.bundle_count = len(self.bundles)
+            self.strategy = strategy
+            self.lifetime = lifetime
+            self.bundle_label_selector = bundle_label_selector
+
+        def ready(self):
+            return None
+
+    class _FakeSlicePlacementGroup:
+        def __init__(self, **kwargs):
+            captured["slice_kwargs"] = kwargs
+            self.placement_group = _FakePG(name="spg_worker")
+            self.bundle_label_selector = [{"ray.io/tpu-slice-name": "tpu-group-0"}] * 8
+
+        def release_head_pgs(self):
+            captured["released_head"] = True
+
+    fake_tpu_mod = types.ModuleType("ray.util.tpu")
+    fake_tpu_mod.SlicePlacementGroup = _FakeSlicePlacementGroup
+    fake_tpu_mod.get_tpu_version_from_type = lambda t: t.lower().replace("tpu-", "")
+
+    def _fake_placement_group(bundles, strategy=None, name=None, lifetime=None, bundle_label_selector=None):
+        pg = _FakePG(
+            name=name,
+            bundles=bundles,
+            strategy=strategy,
+            lifetime=lifetime,
+            bundle_label_selector=bundle_label_selector,
+        )
+        captured["host_pgs"].append(pg)
+        return pg
+
+    platform = PlatformTPU()
+    with (
+        mock.patch.object(ray, "is_initialized", return_value=True),
+        mock.patch.object(ray, "nodes", return_value=fake_nodes),
+        mock.patch.object(ray, "get", return_value=None),
+        mock.patch.dict(sys.modules, {"ray.util.tpu": fake_tpu_mod}),
+        mock.patch("ray.util.placement_group.placement_group", side_effect=_fake_placement_group),
+        mock.patch("ray.util.placement_group.remove_placement_group", side_effect=captured["removed"].append),
+    ):
+        pgs = platform.get_placement_groups(
+            process_on_nodes=[4, 4],
+            bundle={"CPU": 1, "TPU": 1},
+            strategy="STRICT_PACK",
+            pg_name_prefix="sft_pool:",
+            lifetime=None,
+        )
+
+    assert len(pgs) == 2
+    assert captured["slice_kwargs"]["topology"] == "2x4"
+    assert captured["slice_kwargs"]["accelerator_version"] == "v6e"
+    assert captured["slice_kwargs"]["chips_per_vm"] == 4
+    assert captured["slice_kwargs"]["strategy"] == "PACK"
+    assert len(captured["removed"]) == 1
+    assert captured["released_head"] is True
+    assert pgs[0].bundle_count == 4
+    assert pgs[0].bundle_label_selector == [{"ray.io/tpu-slice-name": "tpu-group-0", "ray.io/tpu-worker-id": "0"}] * 4
+    assert pgs[1].bundle_count == 4
+    assert pgs[1].bundle_label_selector == [{"ray.io/tpu-slice-name": "tpu-group-0", "ray.io/tpu-worker-id": "1"}] * 4

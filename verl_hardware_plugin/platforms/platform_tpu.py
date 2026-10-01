@@ -467,57 +467,110 @@ class PlatformTPU(PlatformBase):
             }
         }
 
-    def auto_assign_accelerator_type(self, name_prefix: str, accelerator_type: Optional[str]) -> Optional[str]:
-        """Pin a resource pool to a TPU slice on multi-slice clusters.
-
-        Called unconditionally from ``verl.single_controller.ray.base.RayResourcePool.__init__``
-        whenever ``device_name == "tpu"``; ``PlatformBase`` does not declare it, so the TPU
-        platform has to provide it.
-
-        A KubeRay TPU cluster advertises one ``tpu-group-<n>`` custom resource per slice. Without
-        an affinity label a pool can straddle two slices, which the TPU mesh cannot span, so pin
-        it to the first slice.
-        """
-        if accelerator_type is not None:
-            return accelerator_type
-
-        try:
-            if ray.is_initialized():
-                tpu_slices = set()
-                for node in ray.nodes():
-                    if node.get("Alive"):
-                        for res in node.get("Resources", {}):
-                            if res.startswith("tpu-group-"):
-                                tpu_slices.add(res)
-                slices = sorted(tpu_slices)
-                if slices:
-                    return slices[0]
-        except Exception as e:
-            logger.debug("Could not auto-assign a TPU slice for %r: %s", name_prefix, e)
-
-        return accelerator_type
-
-    def configure_placement_group_bundle(
+    def get_placement_groups(
         self,
-        bundle: dict,
-        use_gpu: bool,
-        device_name: str,
-        name_prefix: str,
+        process_on_nodes: list[int],
+        bundle: dict[str, Any],
+        strategy: str,
+        pg_name_prefix: str,
+        lifetime: Optional[str],
         accelerator_type: Optional[str] = None,
-    ) -> None:
-        """Shape a placement-group bundle for GKE TPU.
+    ) -> list:
+        """Reserve a TPU slice via Ray's SlicePlacementGroup and return one PlacementGroup per host."""
+        from ray.util.placement_group import placement_group, remove_placement_group
+        from ray.util.tpu import SlicePlacementGroup, get_tpu_version_from_type
 
-        Called unconditionally from ``verl.single_controller.ray.base.RayResourcePool``
-        whenever ``device_name == "tpu"``; ``PlatformBase`` does not declare it, so the TPU
-        platform has to provide it.
+        total_chips = sum(process_on_nodes)
+        num_hosts = len(process_on_nodes)
+        chips_per_vm = process_on_nodes[0]
 
-        The slice affinity is requested as a fractional amount so it acts as a label rather
-        than a real reservation.
-        """
-        if use_gpu:
-            bundle[device_name] = 1
-        if accelerator_type is not None:
-            bundle[accelerator_type] = 1e-4
+        topology = None
+        accelerator_version = None
+        has_worker_id_label = False
+
+        if ray.is_initialized():
+            slices_nodes: dict[str, list[dict]] = {}
+            tpu_nodes = []
+            for node in ray.nodes():
+                if not node.get("Alive") or "TPU" not in node.get("Resources", {}):
+                    continue
+                tpu_nodes.append(node)
+                slice_name = node.get("Labels", {}).get("ray.io/tpu-slice-name")
+                if slice_name:
+                    slices_nodes.setdefault(slice_name, []).append(node)
+
+            matching_nodes = []
+            for nodes in slices_nodes.values():
+                slice_chips = sum(int(n.get("Resources", {}).get("TPU", 0)) for n in nodes)
+                if len(nodes) == num_hosts and slice_chips == total_chips:
+                    matching_nodes = nodes
+                    break
+            if not matching_nodes:
+                matching_nodes = tpu_nodes
+
+            if matching_nodes:
+                labels = matching_nodes[0].get("Labels", {})
+                if (
+                    len(matching_nodes) == num_hosts
+                    and sum(int(n.get("Resources", {}).get("TPU", 0)) for n in matching_nodes) == total_chips
+                ):
+                    topology = labels.get("ray.io/tpu-topology")
+                has_worker_id_label = all("ray.io/tpu-worker-id" in n.get("Labels", {}) for n in matching_nodes)
+                raw_type = (
+                    accelerator_type or labels.get("ray.io/accelerator-type") or labels.get("ray.io/tpu-pod-type")
+                )
+                if raw_type:
+                    candidate = raw_type.split("-")[0] if not raw_type.lower().startswith("tpu") else raw_type
+                    try:
+                        accelerator_version = get_tpu_version_from_type(candidate)
+                    except ValueError:
+                        pass
+
+        if not topology:
+            topology = DEFAULT_TPU_TOPOLOGY_MAP.get(total_chips, "").replace(",1", "").replace(",", "x")
+            if not topology:
+                raise ValueError(f"Unsupported TPU chip count {total_chips} for SlicePlacementGroup.")
+
+        if not accelerator_version:
+            accelerator_version = get_tpu_version_from_type(accelerator_type) if accelerator_type else "v6e"
+
+        # Explicitly pass chips_per_vm=process_on_nodes[0] to resolve ambiguous topologies like v6e 2x4
+        # (2 hosts x 4 chips on GKE vs 1 host x 8 chips in Ray's default lookup).
+        tpu_strategy = "PACK" if (strategy == "STRICT_PACK" and num_hosts > 1) else strategy
+        slice_pg = SlicePlacementGroup(
+            topology=topology,
+            accelerator_version=accelerator_version,
+            resources_per_bundle=bundle,
+            strategy=tpu_strategy,
+            name=pg_name_prefix + "0",
+            lifetime=lifetime,
+            chips_per_vm=chips_per_vm,
+        )
+        try:
+            if num_hosts == 1:
+                pgs = [slice_pg.placement_group]
+            else:
+                slice_label = dict(slice_pg.bundle_label_selector[0]) if slice_pg.bundle_label_selector else {}
+                remove_placement_group(slice_pg.placement_group)
+                pgs = []
+                for idx, process_count in enumerate(process_on_nodes):
+                    host_labels = dict(slice_label)
+                    if has_worker_id_label:
+                        host_labels["ray.io/tpu-worker-id"] = str(idx)
+                    label_selector = [host_labels.copy() for _ in range(process_count)] if host_labels else None
+                    pgs.append(
+                        placement_group(
+                            bundles=[bundle.copy() for _ in range(process_count)],
+                            strategy=strategy,
+                            name=pg_name_prefix + str(idx),
+                            lifetime=lifetime,
+                            bundle_label_selector=label_selector,
+                        )
+                    )
+            ray.get([pg.ready() for pg in pgs])
+            return pgs
+        finally:
+            slice_pg.release_head_pgs()
 
     def get_tpu_env_vars(
         self,
@@ -579,8 +632,16 @@ class PlatformTPU(PlatformBase):
             "TPU_VISIBLE_CHIPS": str(local_rank),
         }
 
-        # Derive the mesh from the pod type Ray reports, falling back to the chip count.
-        tpu_nodes = [node for node in ray.nodes() if "TPU" in node.get("Resources", {}) and node.get("Alive")]
+        # Derive the mesh from the pod type of the nodes assigned to this placement group.
+        tpu_nodes = [
+            node
+            for node in ray.nodes()
+            if "TPU" in node.get("Resources", {})
+            and node.get("Alive")
+            and node.get("NodeManagerAddress") in unique_hostnames
+        ]
+        if not tpu_nodes:
+            tpu_nodes = [node for node in ray.nodes() if "TPU" in node.get("Resources", {}) and node.get("Alive")]
         tpu_type = tpu_nodes[0].get("Labels", {}).get("ray.io/tpu-pod-type", "") if tpu_nodes else ""
 
         topology, host_bounds, chips_per_host_bounds, chips_per_host = resolve_tpu_topology_bounds(
