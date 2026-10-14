@@ -222,6 +222,10 @@ class TPUDeviceModuleProxy:
             return lambda *args, **kwargs: 0
         elif name == "reset_peak_memory_stats":
             return lambda *args, **kwargs: None
+        elif name == "memory_stats":
+            return lambda *args, **kwargs: {}
+        elif name == "get_device_name":
+            return lambda *args, **kwargs: "Google TPU"
         elif name == "get_device_properties":
 
             class DummyDeviceProperties:
@@ -299,35 +303,6 @@ class TPUDeviceModuleProxy:
                 self._original_module._clear_cache()
             except Exception as e:
                 logger.warning(f"Failed to clear TPU cache: {e}")
-
-
-def patch_ray_worker() -> None:
-    """Ray ``worker_process_setup_hook`` for GKE TPU pods.
-
-    Runs once in every Ray worker process before any task. It does two things:
-
-    1. Pins ``VERL_PLATFORM=tpu`` so a worker that did not inherit the driver's environment still
-       resolves the TPU platform.
-    2. Makes Raylet's accelerator-id lookup non-fatal. Each GKE pod is given only its own slice of
-       the host's TPU chips, so a host-level index lookup can run off the end of the visible list
-       and raise ``IndexError``. Returning an empty list is correct here: verl assigns chips itself
-       via ``TPU_VISIBLE_CHIPS``.
-    """
-    os.environ["VERL_PLATFORM"] = "tpu"
-
-    try:
-        original_func = ray._private.worker.Worker.get_accelerator_ids_for_accelerator_resource
-
-        def patched_func(self, resource_name, resource_regex):
-            try:
-                return original_func(self, resource_name, resource_regex)
-            except IndexError as e:
-                logger.debug("Intercepted Ray accelerator lookup IndexError for resource %r: %s", resource_name, e)
-                return []
-
-        ray._private.worker.Worker.get_accelerator_ids_for_accelerator_resource = patched_func
-    except Exception as e:
-        logger.warning(f"Failed to apply Ray worker accelerator patch: {e}")
 
 
 def configure_torchrun_tpu_env() -> None:
@@ -419,6 +394,16 @@ class PlatformTPU(PlatformBase):
         configure_torchrun_tpu_env()
         original_tpu = getattr(torch, "tpu", DummyTpuDeviceModule())
         self._device_module = TPUDeviceModuleProxy(original_tpu)
+        if hasattr(torch, "tpu"):
+            for attr in (
+                "reset_peak_memory_stats",
+                "empty_cache",
+                "memory_stats",
+                "get_device_name",
+                "get_device_properties",
+            ):
+                if not hasattr(torch.tpu, attr):
+                    setattr(torch.tpu, attr, getattr(self._device_module, attr))
         self._claimed_slices: set[str] = set()
 
     @property
@@ -497,8 +482,7 @@ class PlatformTPU(PlatformBase):
     def visible_devices_envvar(self) -> str:
         # Deliberately CUDA_VISIBLE_DEVICES, not TPU_VISIBLE_CHIPS. verl assigns
         # os.environ[this key] when launching vLLM servers; pointing it at
-        # TPU_VISIBLE_CHIPS would overwrite the chip index that get_worker_env_vars()
-        # writes and ray_local_rank_override() reads. Changing this breaks rank mapping.
+        # TPU_VISIBLE_CHIPS would overwrite the chip index managed by Ray.
         return "CUDA_VISIBLE_DEVICES"
 
     def is_ipc_supported(self) -> bool:
@@ -523,33 +507,16 @@ class PlatformTPU(PlatformBase):
         pass
 
     def ray_noset_envvars(self) -> list[str]:
-        # CUDA_VISIBLE_DEVICES is listed because visible_devices_envvar() deliberately returns
-        # it (see above), so Ray must be told not to manage that variable either.
-        return [
-            "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
-            "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS",
-        ]
-
-    def ray_local_rank_override(self) -> Optional[str]:
-        # Ray does not enumerate TPU chips, so the index comes from TPU_VISIBLE_CHIPS, which
-        # get_worker_env_vars() sets when the worker is created.
-        return os.environ.get("TPU_VISIBLE_CHIPS", "0")
+        return []
 
     def supports_colocated_worker_groups(self) -> bool:
         # A TPU chip belongs to one process and cannot be shared between colocated WorkerGroups.
         return False
 
     def get_ray_init_kwargs(self) -> dict[str, Any]:
-        """Install the GKE TPU worker setup hook and pin the platform inside Ray workers.
-
-        The hook is passed as a module path rather than the function. Ray exports a function under
-        a generated key and keeps only the function's name in the job's runtime env. vLLM's
-        EngineCore calls ``ray.init`` again with the runtime env it captured from the server actor,
-        and Ray rejects that name as conflicting with the key. A module path round-trips unchanged.
-        """
+        """Pin the TPU platform inside Ray workers."""
         return {
             "runtime_env": {
-                "worker_process_setup_hook": f"{patch_ray_worker.__module__}.{patch_ray_worker.__qualname__}",
                 "env_vars": {"VERL_PLATFORM": "tpu"},
             }
         }
@@ -653,7 +620,8 @@ class PlatformTPU(PlatformBase):
             "TPU_PROCESS_PORT": str(base_port + local_rank),
             "CLOUD_TPU_TASK_ID": str(rank // local_world_size),
             "TPU_WORKER_HOSTNAMES": ",".join(unique_hostnames),
-            "TPU_VISIBLE_CHIPS": str(local_rank),
+            "LOCAL_RANK": str(local_rank),
+            "LOCAL_WORLD_SIZE": str(local_world_size),
         }
 
         # Derive the mesh from the pod type Ray reports, falling back to the chip count.

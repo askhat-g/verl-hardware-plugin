@@ -3,7 +3,6 @@
 
 """Unit tests for the TPU TorchTitan engine utilities on CPU."""
 
-import importlib
 import os
 from types import SimpleNamespace
 from unittest import mock
@@ -36,7 +35,6 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
 )
 from verl_hardware_plugin.accelerators.tpu.platform_tpu import (
     PlatformTPU,
-    patch_ray_worker,
     resolve_tpu_topology_bounds,
 )
 
@@ -276,11 +274,8 @@ def test_auto_assign_accelerator_type_single_slice_shares_slice():
         assert platform.auto_assign_accelerator_type("rollout_pool_0", None) == "tpu-group-0"
 
 
-def test_get_ray_init_kwargs_names_the_setup_hook_by_module_path():
-    hook = PlatformTPU().get_ray_init_kwargs()["runtime_env"]["worker_process_setup_hook"]
-    assert hook == "verl_hardware_plugin.accelerators.tpu.platform_tpu.patch_ray_worker"
-    module_name, _, func_name = hook.rpartition(".")
-    assert getattr(importlib.import_module(module_name), func_name) is patch_ray_worker
+def test_get_ray_init_kwargs_pins_tpu_platform():
+    assert PlatformTPU().get_ray_init_kwargs() == {"runtime_env": {"env_vars": {"VERL_PLATFORM": "tpu"}}}
 
 
 def test_get_tpu_seq_bucket_size_respects_pad_to_length_config():

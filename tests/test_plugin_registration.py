@@ -286,18 +286,12 @@ class TestPlatformRegistration:
         assert platform.ray_resource_options(0) == {}
 
     def test_tpu_core_hooks(self):
-        """The three PlatformBase hooks TPU needs from verl core.
-
-        Inert on verl 0.9.0 -- nothing calls them yet. They are defined
-        unconditionally so the plugin needs no change when core lands the call sites.
-        """
+        """The PlatformBase hooks TPU defines for verl core."""
         from verl_hardware_plugin.accelerators.tpu.platform_tpu import PlatformTPU
 
         platform = PlatformTPU()
         assert platform.supports_colocated_worker_groups() is False
-        assert "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS" in platform.ray_noset_envvars()
-        with mock.patch.dict(os.environ, {"TPU_VISIBLE_CHIPS": "3"}):
-            assert platform.ray_local_rank_override() == "3"
+        assert platform.ray_noset_envvars() == []
 
     def test_tpu_derives_from_platform_base(self):
         """PlatformTPU must not acquire another vendor's platform behaviour by inheritance.
@@ -336,17 +330,10 @@ class TestPlatformRegistration:
         assert platform.get_device_capability() == (None, None)
 
     def test_tpu_ray_noset_envvars(self):
-        """Both entries are load-bearing, including the CUDA one.
-
-        visible_devices_envvar() deliberately returns CUDA_VISIBLE_DEVICES, so Ray must be
-        told not to manage that variable either. Dropping it breaks rank mapping.
-        """
+        """Ray 2.59.0+ natively enumerates and assigns TPU_VISIBLE_CHIPS per actor."""
         from verl_hardware_plugin.accelerators.tpu.platform_tpu import PlatformTPU
 
-        assert PlatformTPU().ray_noset_envvars() == [
-            "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
-            "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS",
-        ]
+        assert PlatformTPU().ray_noset_envvars() == []
 
     def test_tpu_ipc_unsupported(self):
         """TPU has no CUDA-style IPC handle, so verl must fall back to shared memory.
@@ -363,8 +350,7 @@ class TestPlatformRegistration:
         """Intentional, not an oversight: TPU keeps CUDA_VISIBLE_DEVICES.
 
         Returning TPU_VISIBLE_CHIPS here would let vllm_async_server overwrite the
-        chip index that get_worker_env_vars() writes and ray_local_rank_override()
-        reads. See spec D4.
+        chip index managed by Ray.
         """
         from verl_hardware_plugin.accelerators.tpu.platform_tpu import PlatformTPU
 
@@ -409,7 +395,7 @@ class TestPlatformRegistration:
         assert head == on_slice_host
         assert head["TPU_WORKER_HOSTNAMES"] == "10.0.0.1,10.0.0.2"
         assert len(head["TORCH_TPU_SLICEBUILDER_ADDRESSES"].split(",")) == 8
-        assert head["CLOUD_TPU_TASK_ID"] == "1" and head["TPU_VISIBLE_CHIPS"] == "1"
+        assert head["CLOUD_TPU_TASK_ID"] == "1" and head["LOCAL_RANK"] == "1" and "TPU_VISIBLE_CHIPS" not in head
 
     def test_tpu_cudart_returns_none(self):
         """There is no CUDA runtime on a TPU host; PlatformBase documents None as the answer."""
