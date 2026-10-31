@@ -836,10 +836,61 @@ class PlatformTPU(PlatformBase):
                     bundle_ips.append(node_ip_map[node_id])
 
         base_port = TPU_PROCESS_BASE_PORT
-        sb_addresses = [f"{ip}:{base_port + (b_idx % local_world_size)}" for b_idx, ip in enumerate(bundle_ips)]
-
         # Extract unique worker hostnames preserving rank order
         unique_hostnames = list(dict.fromkeys(bundle_ips))
+        # Derive the mesh from the pod type Ray reports for this pool's hosts, falling back to the chip count.
+        tpu_type = ray_tpu_accelerator_name(node_ips=unique_hostnames)
+        tpu_type_chips = (
+            int(tpu_type.rsplit("-", 1)[-1]) if "-" in tpu_type and tpu_type.rsplit("-", 1)[-1].isdigit() else None
+        )
+        chips_per_slice = world_size
+        if not is_tpu_v7x(tpu_type) and len(unique_hostnames) > 1 and len(bundle_ips) == world_size:
+            if tpu_type_chips is not None and 0 < tpu_type_chips < world_size and world_size % tpu_type_chips == 0:
+                chips_per_slice = tpu_type_chips
+            elif (
+                tpu_generation(tpu_type or os.environ.get("TPU_ACCELERATOR_TYPE", "")) == "v6e"
+                and local_world_size == 8
+                and world_size > 8
+                and world_size % 8 == 0
+            ):
+                chips_per_slice = 8
+
+        if 0 < chips_per_slice < world_size and world_size % chips_per_slice == 0:
+            num_slices = world_size // chips_per_slice
+            slice_id = rank // chips_per_slice
+            slice_rank = rank % chips_per_slice
+            slice_start = slice_id * chips_per_slice
+            slice_bundle_ips = bundle_ips[slice_start : slice_start + chips_per_slice]
+            sb_addresses = [
+                f"{ip}:{base_port + (b_idx % local_world_size)}" for b_idx, ip in enumerate(slice_bundle_ips)
+            ]
+            slice_unique_hostnames = list(dict.fromkeys(slice_bundle_ips))
+            megascale_base_port = int(os.environ.get("VERL_MEGASCALE_BASE_PORT", "8080"))
+            env_vars = {
+                "TORCH_TPU_SLICEBUILDER_ADDRESSES": ",".join(sb_addresses),
+                "TPU_PROCESS_ADDRESSES": ",".join(sb_addresses),
+                "TPU_PROCESS_PORT": str(base_port + local_rank),
+                "CLOUD_TPU_TASK_ID": str(slice_rank),
+                "TPU_WORKER_HOSTNAMES": ",".join(slice_unique_hostnames),
+                "LOCAL_RANK": str(local_rank),
+                "LOCAL_WORLD_SIZE": str(local_world_size),
+                "MEGASCALE_NUM_SLICES": str(num_slices),
+                "MEGASCALE_SLICE_ID": str(slice_id),
+                "MEGASCALE_COORDINATOR_ADDRESS": f"{bundle_ips[0]}:{megascale_base_port}",
+                "MEGASCALE_PORT": str(megascale_base_port + 2 * local_rank),
+            }
+            env_vars.update(
+                tpu_mesh_env(
+                    total_chips=chips_per_slice,
+                    num_nodes=len(slice_unique_hostnames),
+                    rank=slice_rank,
+                    local_rank=local_rank,
+                    pod_type=tpu_type,
+                )
+            )
+            return env_vars
+
+        sb_addresses = [f"{ip}:{base_port + (b_idx % local_world_size)}" for b_idx, ip in enumerate(bundle_ips)]
 
         env_vars = {
             "TORCH_TPU_SLICEBUILDER_ADDRESSES": ",".join(sb_addresses),
@@ -851,8 +902,6 @@ class PlatformTPU(PlatformBase):
             "LOCAL_WORLD_SIZE": str(local_world_size),
         }
 
-        # Derive the mesh from the pod type Ray reports for this pool's hosts, falling back to the chip count.
-        tpu_type = ray_tpu_accelerator_name(node_ips=unique_hostnames)
         env_vars.update(
             tpu_mesh_env(
                 total_chips=world_size,
