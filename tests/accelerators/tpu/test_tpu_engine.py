@@ -37,6 +37,7 @@ from verl_hardware_plugin.accelerators.tpu.platform_tpu import (
     PlatformTPU,
     configure_torchrun_tpu_env,
     gke_tpu_slice_topology,
+    is_tpu_v5p,
     is_tpu_v7x,
     ray_tpu_accelerator_name,
     resolve_tpu_topology_bounds,
@@ -369,6 +370,32 @@ def test_tpu_generation_reads_every_spelling():
     with mock.patch.dict(os.environ, _env_without_webhook(), clear=True):
         assert not is_tpu_v7x()
         assert is_tpu_v7x("v7x-16") and is_tpu_v7x("tpu7x-8")
+        assert not is_tpu_v5p()
+        assert is_tpu_v5p("v5p-32") and is_tpu_v5p("TPU-V5P")
+    with mock.patch.dict(os.environ, {**_env_without_webhook(), "TPU_ACCELERATOR_TYPE": "v5p"}, clear=True):
+        assert is_tpu_v5p()
+        assert not is_tpu_v5p("v6e-8")
+
+
+def test_resolve_tpu_topology_bounds_tpu_v5p():
+    env = _env_without_webhook()
+    with mock.patch.dict(os.environ, {**env, "TPU_ACCELERATOR_TYPE": "v5p"}, clear=True):
+        assert resolve_tpu_topology_bounds(total_chips=4, num_nodes=1) == ("2,2,1", "1,1,1", "2,2,1", "4")
+        assert resolve_tpu_topology_bounds(total_chips=8, num_nodes=2) == ("2,2,2", "2,2,2", "1,1,1", "4")
+        assert resolve_tpu_topology_bounds(total_chips=16, num_nodes=4) == ("2,2,4", "2,2,4", "1,1,1", "4")
+        assert resolve_tpu_topology_bounds(total_chips=32, num_nodes=8) == ("2,4,4", "2,4,4", "1,1,1", "4")
+        assert resolve_tpu_topology_bounds(total_chips=64, num_nodes=16) == ("4,4,4", "4,4,4", "1,1,1", "4")
+        with pytest.raises(ValueError, match="Cannot determine the TPU topology"):
+            resolve_tpu_topology_bounds(total_chips=6, num_nodes=2)
+    with mock.patch.dict(
+        os.environ,
+        {**env, "TPU_ACCELERATOR_TYPE": "v5p", "TPU_HOST_BOUNDS": "1,1,4", "TPU_CHIPS_PER_HOST_BOUNDS": "2,2,1"},
+        clear=True,
+    ):
+        assert resolve_tpu_topology_bounds(total_chips=16, num_nodes=4) == ("2,2,4", "2,2,4", "1,1,1", "4")
+    with mock.patch.dict(os.environ, env, clear=True):
+        assert resolve_tpu_topology_bounds(total_chips=16, num_nodes=4, pod_type="v5p-32")[0] == "2,2,4"
+        assert resolve_tpu_topology_bounds(total_chips=8, num_nodes=2, pod_type="v5p-16")[0] == "2,2,2"
 
 
 def test_resolve_tpu_topology_bounds_tpu7x_one_process_per_core():

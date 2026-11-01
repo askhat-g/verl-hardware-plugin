@@ -80,10 +80,32 @@ DEFAULT_TPU_TOPOLOGY_MAP = {
 # Pod types are consulted first: a pod type names the physical slice exactly, whereas the chip
 # count is only the number of chips this job was given and can be a subset of the slice.
 TPU_POD_TYPE_TOPOLOGY_MAP = {
+    "v5p-8": "2,2,1",
+    "v5p-16": "2,2,2",
+    "v5p-32": "2,2,4",
+    "v5p-64": "2,4,4",
+    "v5p-128": "4,4,4",
+    "v5p-256": "4,4,8",
+    "v5p-512": "4,8,8",
     "v6e-4": "2,2,1",
     "v6e-8": "2,4,1",
     "v6e-16": "4,4,1",
     "v6e-32": "4,8,1",
+}
+
+# TPU v5p: 3-D mesh ``x,y,z`` of chips (1 logical Megacore device per chip). A host holds 4 chips
+# (``2x2x1``); multi-host slices stack along Z then X/Y (``2x2x2`` = 8 chips, ``2x2x4`` = 16,
+# ``2x4x4`` = 32, ``4x4x4`` = 64, ``4x4x8`` = 128, ``4x8x8`` = 256).
+TPU_V5P_TOPOLOGY_MAP = {
+    1: "1,1,1",
+    2: "1,2,1",
+    4: "2,2,1",
+    8: "2,2,2",
+    16: "2,2,4",
+    32: "2,4,4",
+    64: "4,4,4",
+    128: "4,4,8",
+    256: "4,8,8",
 }
 
 # Slices at or below this many chips live on a single host, so the chips are addressed within
@@ -132,6 +154,12 @@ def is_tpu_v7x(pod_type: str = "") -> bool:
     ``ray_tpu_accelerator_name``) or, failing that, GKE's ``TPU_ACCELERATOR_TYPE`` of this pod, which
     torchtitan's launcher tests the same way (``startswith("tpu7x")``)."""
     return tpu_generation(pod_type or os.environ.get("TPU_ACCELERATOR_TYPE", "")) == "v7x"
+
+
+def is_tpu_v5p(pod_type: str = "") -> bool:
+    """Whether the slice is TPU v5p: ``pod_type`` (what Ray reports for the pool, see
+    ``ray_tpu_accelerator_name``) or, failing that, GKE's ``TPU_ACCELERATOR_TYPE`` of this pod."""
+    return tpu_generation(pod_type or os.environ.get("TPU_ACCELERATOR_TYPE", "")) == "v5p"
 
 
 def _bounds(value: str) -> list[int]:
@@ -295,17 +323,26 @@ def resolve_tpu_topology_bounds(
         v7x_topology = resolve_tpu_v7x_topology(total_chips, num_nodes)
         return v7x_topology, v7x_topology, TPU_V7X_PROCESS_BOUNDS, chips_per_host
 
+    v5p = is_tpu_v5p(pod_type)
+    topology_map = TPU_V5P_TOPOLOGY_MAP if v5p else DEFAULT_TPU_TOPOLOGY_MAP
+
     env_topology = os.environ.get("TORCH_TPU_TOPOLOGY", "")
     if env_topology and math.prod(_bounds(env_topology)) != total_chips:
         env_topology = ""
+    slice_topology, slice_hosts = gke_tpu_slice_topology() if v5p else ("", 0)
+    if slice_topology and (math.prod(_bounds(slice_topology)) != total_chips or slice_hosts != num_nodes):
+        slice_topology = ""
     topology = (
-        env_topology or TPU_POD_TYPE_TOPOLOGY_MAP.get(pod_type.lower()) or DEFAULT_TPU_TOPOLOGY_MAP.get(total_chips)
+        env_topology
+        or TPU_POD_TYPE_TOPOLOGY_MAP.get(pod_type.lower())
+        or slice_topology
+        or topology_map.get(total_chips)
     )
     if not topology:
         raise ValueError(
             f"Cannot determine the TPU topology for total_chips={total_chips} "
             f"(pod_type={pod_type!r}). Set TORCH_TPU_TOPOLOGY='x,y,z' to override. "
-            f"Known chip counts: {sorted(DEFAULT_TPU_TOPOLOGY_MAP)}."
+            f"Known chip counts: {sorted(topology_map)}."
         )
 
     if total_chips <= TPU_SINGLE_HOST_MAX_CHIPS:

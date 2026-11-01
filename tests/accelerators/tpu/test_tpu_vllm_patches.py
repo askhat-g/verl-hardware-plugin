@@ -171,3 +171,18 @@ def test_init_workers_ray_updates_worker_block_size_after_load_model():
         "load_model",
         tpu_vllm_patches._update_worker_block_size,
     ]
+
+
+def test_tpu_worker_envs_v5p_uses_3d_topology():
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("TORCH_TPU_TOPOLOGY", "TPU_ACCELERATOR_TYPE", "TPU_HOST_BOUNDS", "TPU_CHIPS_PER_HOST_BOUNDS")
+    }
+    worker_ips = [f"10.0.0.{h}" for h in range(1, 5) for _ in range(4)]
+    with mock.patch.dict("os.environ", env, clear=True):
+        envs = tpu_vllm_patches._tpu_worker_envs(worker_ips, base_port=8070, pod_type="v5p-32")
+    assert len(envs) == 16
+    assert envs[0]["TORCH_TPU_TOPOLOGY"] == "2,2,4"
+    assert envs[0]["TPU_HOST_BOUNDS"] == "2,2,4"
+    assert envs[0]["TPU_CHIPS_PER_HOST_BOUNDS"] == "1,1,1"
