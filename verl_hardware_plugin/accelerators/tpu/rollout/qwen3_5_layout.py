@@ -48,8 +48,8 @@ from typing import Any, Callable, Iterator, NamedTuple, Optional
 
 import torch
 
-# HF model types of the Qwen3.5 text models this module installs.
-QWEN3_5_MODEL_TYPES = ("qwen3_5_text", "qwen3_5_moe_text")
+# HF model types of the Qwen3.5 and Qwen3-MoE text models this module installs.
+QWEN3_5_MODEL_TYPES = ("qwen3_5_text", "qwen3_5_moe_text", "qwen3_moe")
 
 # Trainer tensors that every rank receives whole: vLLM keeps them unsharded (the MoE router and shared-expert
 # gate), or they are tiny and sliced on the receiver (A_log / dt_bias).
@@ -144,9 +144,18 @@ class Qwen3_5Dims(NamedTuple):
 
     @classmethod
     def from_config(cls, hf_text_config: Any) -> Qwen3_5Dims:
+        model_type = getattr(hf_text_config, "model_type", None)
+        moe_inter = getattr(hf_text_config, "moe_intermediate_size", None)
+        if model_type == "qwen3_moe":
+            return cls(
+                key_dim=0,
+                value_dim=0,
+                num_k_heads=0,
+                num_v_heads=0,
+                moe_intermediate_size=int(moe_inter) if moe_inter else None,
+            )
         num_k_heads = int(hf_text_config.linear_num_key_heads)
         num_v_heads = int(hf_text_config.linear_num_value_heads)
-        moe_inter = getattr(hf_text_config, "moe_intermediate_size", None)
         return cls(
             key_dim=num_k_heads * int(hf_text_config.linear_key_head_dim),
             value_dim=num_v_heads * int(hf_text_config.linear_value_head_dim),
@@ -255,6 +264,18 @@ def plan_direct_install(
     if dims.moe_intermediate_size and dims.moe_intermediate_size % tp_size:
         return None, f"moe_intermediate_size {dims.moe_intermediate_size} does not split over TP={tp_size}"
 
+    # Every layer must be complete: a missing piece would otherwise fail mid-install, after earlier layers of the
+    # live vLLM model were already overwritten.
+    gdn_layers = {n.split(".linear_attn.", 1)[0] for n in global_shapes if ".linear_attn." in n}
+    expert_blocks = {n.split(".mlp.experts.", 1)[0] for n in global_shapes if ".mlp.experts." in n}
+    if model_type == "qwen3_moe":
+        if gdn_layers:
+            return None, f"model_type {model_type!r} is not a Qwen3.5 text model"
+        if not expert_blocks:
+            return None, "the trainer sent no MoE expert tensors"
+    elif not gdn_layers:
+        return None, "the trainer sent no GatedDeltaNet (linear_attn) tensors"
+
     expected_rows = {
         ".in_proj_q.weight": dims.key_dim,
         ".in_proj_k.weight": dims.key_dim,
@@ -266,12 +287,6 @@ def plan_direct_install(
             if name.endswith(".linear_attn" + suffix) and shape[0] != rows:
                 return None, f"{name} has {shape[0]} rows, the config gives {rows}"
 
-    # Every layer must be complete: a missing piece would otherwise fail mid-install, after earlier layers of the
-    # live vLLM model were already overwritten.
-    gdn_layers = {n.split(".linear_attn.", 1)[0] for n in global_shapes if ".linear_attn." in n}
-    if not gdn_layers:
-        return None, "the trainer sent no GatedDeltaNet (linear_attn) tensors"
-    expert_blocks = {n.split(".mlp.experts.", 1)[0] for n in global_shapes if ".mlp.experts." in n}
     for layers, suffixes in ((gdn_layers, GDN_LAYER_SUFFIXES), (expert_blocks, EXPERT_BLOCK_SUFFIXES)):
         for layer in sorted(layers):
             missing = [s for s in suffixes if layer + s not in global_shapes]
@@ -282,20 +297,23 @@ def plan_direct_install(
     gdn_modules = [m for _, m in modules if hasattr(m, "in_proj_qkvz") and hasattr(m, "in_proj_ba")]
     if len(gdn_modules) != len(gdn_layers):
         return None, f"vLLM has {len(gdn_modules)} fused in_proj_qkvz layers, the trainer sent {len(gdn_layers)}"
-    tp_ranks = set()
-    for m in gdn_modules:
-        if getattr(m, "gqa_interleaved_layout", False):
-            return None, "vLLM's GatedDeltaNet uses the interleaved (Qwen3-Next) in_proj_qkvz layout"
-        if getattr(m, "disable_tp_for_ba_proj", False):
-            return None, "vLLM replicates in_proj_ba (disable_tp_for_ba_proj)"
-        if getattr(m, "tp_size", tp_size) != tp_size:
-            return None, f"vLLM's GatedDeltaNet tp_size {m.tp_size} != {tp_size}"
-        tp_ranks.add(int(getattr(m, "tp_rank", worker_rank)))
-    if len(tp_ranks) > 1:
-        return None, f"vLLM's GatedDeltaNet layers disagree on the TP rank: {sorted(tp_ranks)}"
-    tp_rank = tp_ranks.pop()
-    if tp_rank != worker_rank:
-        return None, f"worker rank {worker_rank} is not its TP rank {tp_rank}"
+    if gdn_modules:
+        tp_ranks = set()
+        for m in gdn_modules:
+            if getattr(m, "gqa_interleaved_layout", False):
+                return None, "vLLM's GatedDeltaNet uses the interleaved (Qwen3-Next) in_proj_qkvz layout"
+            if getattr(m, "disable_tp_for_ba_proj", False):
+                return None, "vLLM replicates in_proj_ba (disable_tp_for_ba_proj)"
+            if getattr(m, "tp_size", tp_size) != tp_size:
+                return None, f"vLLM's GatedDeltaNet tp_size {m.tp_size} != {tp_size}"
+            tp_ranks.add(int(getattr(m, "tp_rank", worker_rank)))
+        if len(tp_ranks) > 1:
+            return None, f"vLLM's GatedDeltaNet layers disagree on the TP rank: {sorted(tp_ranks)}"
+        tp_rank = tp_ranks.pop()
+        if tp_rank != worker_rank:
+            return None, f"worker rank {worker_rank} is not its TP rank {tp_rank}"
+    else:
+        tp_rank = worker_rank
 
     moe_layout = None
     if expert_blocks:

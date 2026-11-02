@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from collections import Counter
 from typing import Any, Callable, Iterable, Iterator, Optional
 
@@ -22,6 +23,8 @@ from torch.distributed.tensor import DTensor, Shard
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+_EXPERT_SLOT_RE = re.compile(r"^(.*\.mlp\.experts)\.\d+\.(gate_proj|up_proj|down_proj)\.weight$")
 
 
 def fsdp_dim0_shard(param: Any) -> Optional[tuple[int, int]]:
@@ -180,9 +183,28 @@ class TrainerWeights:
             yield name, tensor, shard
             del tensor, param
         exported.clear()
-        # Fused expert stacks are always gathered, then split into one HF tensor per expert.
+        # Fused expert stacks are exported as 3-D local FSDP shards for tpu-sync when their HF slot names
+        # match ``.mlp.experts.<idx>.(gate|up|down)_proj.weight``, or gathered and split per expert otherwise.
         while self._expert_stacks:
             stack, slots = self._expert_stacks.pop(0)
+            m = _EXPERT_SLOT_RE.match(slots[0][0]) if (local and slots) else None
+            if m is not None:
+                stacked_name = f"{m.group(1)}.{m.group(2)}"
+                if isinstance(stack, DTensor):
+                    shard = fsdp_dim0_shard(stack)
+                    if shard is not None:
+                        tensor = _bf16_on(stack.to_local(), device)
+                        counts["local"] += 1
+                    else:
+                        kind = "replicated" if _is_replicated(stack) else "gathered"
+                        counts[kind] += 1
+                        tensor = stack.to(device, dtype=torch.bfloat16, non_blocking=True).full_tensor()
+                else:
+                    tensor, shard = _bf16_on(stack, device), None
+                    counts["replicated"] += 1
+                yield stacked_name, tensor, shard
+                del tensor, stack
+                continue
             if local and isinstance(stack, DTensor) and not _is_replicated(stack):
                 counts["gathered"] += 1
                 logger.info(
@@ -194,7 +216,7 @@ class TrainerWeights:
             full = full.to(torch.bfloat16, non_blocking=True)
             for e, (hf_name, _shape) in enumerate(slots):
                 yield hf_name, full[e].clone(), None
-            del full
+            del full, stack
         if local:
             logger.info(
                 f"Weight export: {counts['local']} local shards, {counts['replicated']} replicated tensors (fused "

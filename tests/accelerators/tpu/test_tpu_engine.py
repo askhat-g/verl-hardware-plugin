@@ -1033,14 +1033,33 @@ def _trainer_weights_worker(rank: int, world: int, init_file: str) -> None:
             assert fsdp_dim0_shard(params[name]) is None, name
 
         def weights() -> TrainerWeights:
-            return TrainerWeights(dict(params), [(stack_dt, [("x.0", (3, 4)), ("x.1", (3, 4))])], "cpu")
+            return TrainerWeights(
+                dict(params),
+                [
+                    (stack_dt, [("x.0", (3, 4)), ("x.1", (3, 4))]),
+                    (
+                        stack_dt,
+                        [
+                            ("model.layers.0.mlp.experts.0.gate_proj.weight", (3, 4)),
+                            ("model.layers.0.mlp.experts.1.gate_proj.weight", (3, 4)),
+                        ],
+                    ),
+                ],
+                "cpu",
+            )
 
-        local_names = {"a.even", "model.embed_tokens.weight", "lm_head.weight"}
+        moe_3d_name = "model.layers.0.mlp.experts.gate_proj"
+        local_names = {"a.even", "model.embed_tokens.weight", "lm_head.weight", moe_3d_name}
         exported = list(weights().local_shards())
-        assert [name for name, _, _ in exported] == [*params, "x.0", "x.1"]
+        assert [name for name, _, _ in exported] == [*params, "x.0", "x.1", moe_3d_name]
         for name, tensor, shard in exported:
             assert tensor.dtype == torch.bfloat16, name
-            expected = (stack[int(name[-1])] if name.startswith("x.") else full[name]).to(torch.bfloat16)
+            if name == moe_3d_name:
+                expected = stack.to(torch.bfloat16)
+            elif name.startswith("x."):
+                expected = stack[int(name[-1])].to(torch.bfloat16)
+            else:
+                expected = full[name].to(torch.bfloat16)
             if name in local_names:
                 assert shard == (world, rank), name
                 assert torch.equal(tensor, expected.chunk(world, dim=0)[rank]), name
@@ -1062,15 +1081,40 @@ def _trainer_weights_worker(rank: int, world: int, init_file: str) -> None:
         # The dense parameters may come as several dicts (one per layer), consumed lazily; same export.
         names = list(params)
         chunks = iter([{n: params[n] for n in names[:2]}, {n: params[n] for n in names[2:]}])
-        chunked = list(TrainerWeights(chunks, [(stack_dt, [("x.0", (3, 4)), ("x.1", (3, 4))])], "cpu").local_shards())
+        chunked = list(
+            TrainerWeights(
+                chunks,
+                [
+                    (stack_dt, [("x.0", (3, 4)), ("x.1", (3, 4))]),
+                    (
+                        stack_dt,
+                        [
+                            ("model.layers.0.mlp.experts.0.gate_proj.weight", (3, 4)),
+                            ("model.layers.0.mlp.experts.1.gate_proj.weight", (3, 4)),
+                        ],
+                    ),
+                ],
+                "cpu",
+            ).local_shards()
+        )
         assert [(n, s) for n, _, s in chunked] == [(n, s) for n, _, s in exported]
         for (name, tensor, _), (_, ref, _) in zip(chunked, exported, strict=True):
             assert torch.equal(tensor, ref), name
 
         gathered = list(weights())  # plain iteration: every tensor full, as verl expects
-        assert [name for name, _ in gathered] == [*params, "x.0", "x.1"]
+        assert [name for name, _ in gathered] == [
+            *params,
+            "x.0",
+            "x.1",
+            "model.layers.0.mlp.experts.0.gate_proj.weight",
+            "model.layers.0.mlp.experts.1.gate_proj.weight",
+        ]
         for name, tensor in gathered:
-            expected = (stack[int(name[-1])] if name.startswith("x.") else full[name]).to(torch.bfloat16)
+            if name.startswith("x.") or ".mlp.experts." in name:
+                idx = int(name.split(".mlp.experts.", 1)[1].split(".", 1)[0]) if ".mlp.experts." in name else int(name[-1])
+                expected = stack[idx].to(torch.bfloat16)
+            else:
+                expected = full[name].to(torch.bfloat16)
             assert torch.equal(tensor, expected), name
     finally:
         dist.destroy_process_group()

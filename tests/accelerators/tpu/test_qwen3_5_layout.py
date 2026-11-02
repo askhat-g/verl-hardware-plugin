@@ -277,6 +277,10 @@ def test_plan_direct_install():
     no_gdn = torch.nn.Module()
     no_gdn.experts = _Experts(VllmUnquantizedFusedMoEMethod())
     assert "in_proj_qkvz" in reason(no_gdn)  # e.g. LoRA: separate in_proj_qkv / in_proj_z
+    moe_only_shapes = {n: s for n, s in SHAPES.items() if ".linear_attn." not in n}
+    moe_only_cfg = SimpleNamespace(model_type="qwen3_moe", moe_intermediate_size=INTER)
+    plan_moe, why_moe = qwen3_5_layout.plan_direct_install(no_gdn, moe_only_shapes, moe_only_cfg, 2, 0)
+    assert why_moe == "" and plan_moe is not None and plan_moe.moe_layout == qwen3_5_layout.MOE_LAYOUT_TPU
 
 
 def test_trainer_weights_applies_local_transform_only_to_local_shards():

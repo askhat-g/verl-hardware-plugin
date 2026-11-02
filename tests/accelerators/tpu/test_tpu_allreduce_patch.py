@@ -136,3 +136,42 @@ def test_gloo_only_group_all_gather_into_tensor_stages_via_cpu():
         tpu_patch_mod.apply()
         assert dist.all_gather_into_tensor(out, inp, group="dp_gloo") == "ok"
     assert out._cpu.tolist() == [1.0, 2.0, 3.0, 6.0]
+
+
+def test_hybrid_gloo_tpu_group_stages_max_and_min_via_cpu():
+    class _FakeTPUTensor:
+        device = mock.Mock(type="tpu")
+
+        def __init__(self, val: int):
+            self._cpu = torch.tensor([val])
+            self.copied = None
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self._cpu.clone()
+
+        def copy_(self, src):
+            self.copied = src.clone()
+            return self
+
+    def _fake_orig_all_reduce(t, op=None, group=None, async_op=False):
+        assert t.device.type == "cpu"
+        assert op == dist.ReduceOp.MAX
+        t.fill_(8)
+        return "ok"
+
+    fake_tpu_tensor = _FakeTPUTensor(3)
+    with (
+        mock.patch.object(tpu_patch_mod, "_tpu_available", return_value=True),
+        mock.patch.object(dist, "all_reduce", side_effect=_fake_orig_all_reduce),
+        mock.patch.object(dist, "get_backend", return_value="cpu:gloo,tpu:tpu_dist"),
+    ):
+        tpu_patch_mod.apply()
+        res = dist.all_reduce(fake_tpu_tensor, op=dist.ReduceOp.MAX, group="world")
+
+    assert res == "ok"
+    assert fake_tpu_tensor.copied is not None
+    assert fake_tpu_tensor.copied.tolist() == [8]
+

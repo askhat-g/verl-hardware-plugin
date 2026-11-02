@@ -48,6 +48,23 @@ def _is_gloo_only_group_with_tpu_tensor(tensor: Any, group: Any) -> bool:
     return "gloo" in backend and "tpu_dist" not in backend
 
 
+def _needs_cpu_staging_for_all_reduce(tensor: Any, op: Any, group: Any) -> bool:
+    if torch.compiler.is_compiling():
+        return False
+    device = getattr(tensor, "device", None)
+    if getattr(device, "type", None) != "tpu":
+        return False
+    try:
+        backend = str(dist.get_backend(group))
+    except Exception:
+        return False
+    if "gloo" not in backend:
+        return False
+    if "tpu_dist" not in backend:
+        return group is not None
+    return op in (dist.ReduceOp.MAX, dist.ReduceOp.MIN)
+
+
 def apply() -> None:
     global _applied
     if _applied:
@@ -64,7 +81,7 @@ def apply() -> None:
         # the traced function is the current `dist.all_reduce` attribute (i.e. this wrapper). A forwarded
         # `ReduceOp.SUM` default would reach `_functional_collectives.all_reduce` unconverted and fail with
         # "'RedOpType' object has no attribute 'lower'" (e.g. vLLM's compiled tensor-parallel all-reduce).
-        if not async_op and _is_gloo_only_group_with_tpu_tensor(tensor, group):
+        if not async_op and _needs_cpu_staging_for_all_reduce(tensor, op, group):
             cpu_tensor = tensor.detach().cpu()
             if op is None:
                 result = original_all_reduce(cpu_tensor, group=group, async_op=False)
