@@ -548,6 +548,48 @@ def test_auto_assign_accelerator_type_single_slice_shares_slice():
         assert platform.auto_assign_accelerator_type("rollout_pool_0", None) == "tpu-group-0"
 
 
+def test_get_tpu_env_vars_multislice_v6e8_megascale():
+    platform = PlatformTPU()
+    nodes = [
+        {
+            "NodeID": f"node-{idx}",
+            "Alive": True,
+            "NodeManagerAddress": f"10.204.0.{idx + 1}",
+            "Resources": {"TPU": 8.0, "tpu-group-0": 1.0},
+            "Labels": {"ray.io/tpu-pod-type": "v6e-8"},
+        }
+        for idx in range(4)
+    ]
+    pgs = [SimpleNamespace(id=f"pg-{idx}") for idx in range(4)]
+
+    def _pg_table(pg_id: str) -> dict:
+        idx = int(pg_id.split("-")[1])
+        return {"state": "CREATED", "bundles_to_node_id": {b: f"node-{idx}" for b in range(8)}}
+
+    with (
+        mock.patch("ray.is_initialized", return_value=True),
+        mock.patch("ray.nodes", return_value=nodes),
+        mock.patch("ray._private.state.state.placement_group_table", side_effect=_pg_table),
+    ):
+        env_vars = platform.get_tpu_env_vars(
+            rank=19,
+            world_size=32,
+            local_rank=3,
+            local_world_size=8,
+            name_prefix="global_pool",
+            pgs=pgs,
+        )
+    assert env_vars["MEGASCALE_NUM_SLICES"] == "4"
+    assert env_vars["MEGASCALE_SLICE_ID"] == "2"
+    assert env_vars["MEGASCALE_COORDINATOR_ADDRESS"] == "10.204.0.1:8080"
+    assert env_vars["MEGASCALE_PORT"] == "8086"
+    assert env_vars["CLOUD_TPU_TASK_ID"] == "3"
+    assert env_vars["TPU_WORKER_HOSTNAMES"] == "10.204.0.3"
+    assert env_vars["TORCH_TPU_TOPOLOGY"] == "2,4,1"
+    assert env_vars["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == ",".join(f"10.204.0.3:{8471 + b}" for b in range(8))
+
+
+
 def _clear_forwarded_tpu_env(monkeypatch):
     """Unset the variables the platform forwards, so the test shell's own exports do not leak in."""
     for name in list(os.environ):
