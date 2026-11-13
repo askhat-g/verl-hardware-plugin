@@ -1,4 +1,5 @@
 # Copyright (c) 2026 Google LLC. All rights reserved.
+# Diagnostics adapted from verl: Copyright 2025 Bytedance Ltd. and/or its affiliates.
 # Licensed under the Apache License, Version 2.0.
 
 """Standalone TorchTitan training engine for Google TPU (``torch_tpu``) devices.
@@ -38,6 +39,7 @@ import re
 import shutil
 from collections.abc import Collection, Iterable, Mapping
 from contextlib import nullcontext
+from functools import partial
 from typing import Any, Callable, Iterator, Optional
 
 import torch
@@ -50,6 +52,7 @@ from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
 from torch.distributed.tensor.experimental._context_parallel._load_balancer import _HeadTailLoadBalancer
 
 from verl.trainer.config import CheckpointConfig
+from verl.trainer.ppo.core_algos import agg_loss
 from verl.utils import tensordict_utils as tu
 from verl.utils import torch_functional as verl_F
 from verl.utils.dataset.dataset_utils import DatasetPadMode
@@ -59,6 +62,7 @@ from verl.utils.fsdp_utils import (
     load_fsdp_optimizer,
     offload_fsdp_optimizer,
 )
+from verl.utils.metric import AggregationType, Metric
 from verl.utils.model import extract_multi_modal_inputs
 from verl.utils.torch_functional import logprobs_from_logits_naive
 from verl.workers.config import HFModelConfig, TorchtitanEngineConfig, TorchtitanOptimizerConfig
@@ -69,12 +73,16 @@ from verl.workers.engine.utils import (
     postprocess_batch_func,
     prepare_micro_batches,
 )
+from verl.workers.utils.losses import ppo_loss
+from verl.workers.utils.padding import no_padding_2_padding
 from verl_hardware_plugin.accelerators.tpu.engines import tpu_model_kernels, tpu_ragged_ep
 from verl_hardware_plugin.accelerators.tpu.engines.fused_logprob import fused_linear_logprobs_tpu
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     TPU_PADDED_VALUES_ATTR,
     ContextParallelGather,
     align_micro_batch_shapes_across_ranks,
+    apply_fp32_logits_tpu,
+    apply_tpu_precision_patches,
     bucket_length,
     chunked_entropy_from_hidden_tpu,
     compute_global_batch_num_tokens,
@@ -95,6 +103,7 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     resolve_tpu_splash_max_block_size,
     resolve_tpu_torchtitan_options,
     resolve_tpu_use_fused_linear_cross_entropy,
+    row_slot_permutation,
     set_splash_max_block_size,
     spmd_no_typecheck_context,
     torchtitan_model_attn_backend,
@@ -976,6 +985,27 @@ class TorchTitanTPUEngine(BaseEngine):
             **tpu_model_kernels.model_registry_kwargs(self._tpu_kernels),
             **(setup.registry_kwargs() if setup else {}),
         )
+        if self.model_config.hf_config.model_type == "qwen3_moe" and torchtitan_flavor in (
+            "30B-A3B",
+            "30B-A3B-global-aux",
+        ):
+            from torchtitan.models.common.moe import MoE
+
+            if tpu_options.qwen3_pallas_experts is False:
+                raise ValueError("qwen3_pallas_experts=False is unsupported: Qwen3 MoE requires Pallas on TPU")
+            if tpu_options.moe_paired_grouped_mm is None and tpu_options.moe_paired_gemm is not None:
+                tpu_options = self._tpu_options = dataclasses.replace(
+                    tpu_options, moe_paired_grouped_mm=tpu_options.moe_paired_gemm
+                )
+            # Upstream configures the experts and balancing; only disable training-only auxiliary losses here.
+            moe_configs = list(model_spec.model.traverse(MoE.Config))
+            if not moe_configs:
+                raise ValueError("Qwen3-30B config has no MoE layers")
+            for _, moe, _, _ in moe_configs:
+                if hasattr(moe, "aux_loss"):
+                    moe.aux_loss = None
+                if hasattr(moe.router, "aux_loss"):
+                    moe.router.aux_loss = None
         tpu_model_kernels.configure_model_spec(
             model_spec,
             self._tpu_kernels,
@@ -1069,7 +1099,11 @@ class TorchTitanTPUEngine(BaseEngine):
             "disable_cuda_graphs": True,
             "max_norm": self.optimizer_config.clip_grad,
         }
+        if tpu_options.mixed_precision_param is not None:
+            training_kwargs["mixed_precision_param"] = tpu_options.mixed_precision_param
         if self.engine_config.forward_only:
+            # dtype controls parameter storage; mixed_precision_param controls
+            # FSDP's compute/all-gather dtype. Preserve both independent choices.
             engine_dtype = getattr(self.engine_config, "dtype", "bfloat16")
             if engine_dtype in ("bfloat16", "float32"):
                 training_kwargs["dtype"] = engine_dtype
@@ -1140,6 +1174,14 @@ class TorchTitanTPUEngine(BaseEngine):
             if self._use_fused_linear_cross_entropy
             else "LM-head logits + chunked log-softmax",
         )
+        self._gdn_row_slot_len = int(tpu_options.gdn_row_slot_len or 0)
+        if self._gdn_row_slot_len:
+            if not self._use_fused_linear_cross_entropy:
+                raise ValueError("gdn_row_slot_len needs the fused log-prob path (use_fused_linear_cross_entropy)")
+            # Each gdn_row_slot_len-token row holds one sequence, so the GatedDeltaNet needs no document resets.
+            self.config.override.imports.append(
+                ("torchtitan.experiments.tpu.qwen3_5.gated_delta.gated_delta_document_resets", {"enabled": False})
+            )
         for override_import in tpu_model_kernels.override_imports(self._tpu_kernels):
             if override_import not in self.config.override.imports:
                 self.config.override.imports.append(override_import)
@@ -1161,6 +1203,9 @@ class TorchTitanTPUEngine(BaseEngine):
             for model_part in model_parts:
                 enable_fsdp_gradient_division(model_part, dp_size)
 
+        apply_tpu_precision_patches(model_parts)
+        if tpu_options.fp32_logits and not self._use_fused_linear_cross_entropy:
+            apply_fp32_logits_tpu(model_parts)
         if self._use_splash_attention:
             set_splash_max_block_size(resolve_tpu_splash_max_block_size(engine_config))
         install_tpu_attention(model_parts, use_splash=self._use_splash_attention)
@@ -1387,6 +1432,14 @@ class TorchTitanTPUEngine(BaseEngine):
         if not self.engine_config.forward_only:
             self.optimizer = self.trainer.optimizers
             self.lr_scheduler = self.trainer.lr_schedulers
+            if self._tpu_options.frozen_param_regex:
+                pattern = re.compile(self._tpu_options.frozen_param_regex)
+                self._frozen_params = [p for m in self.module for n, p in m.named_parameters() if pattern.search(n)]
+                logger.info(
+                    "frozen_param_regex=%r freezes %d parameters",
+                    self._tpu_options.frozen_param_regex,
+                    len(self._frozen_params),
+                )
         else:
             self.optimizer = None
             self.lr_scheduler = None
@@ -1477,15 +1530,17 @@ class TorchTitanTPUEngine(BaseEngine):
         tpu_options = get_tpu_engine_options(self.engine_config)
         static_len = int(tpu_options.static_micro_batch_len or 0)
         static_response_len = int(tpu_options.static_max_response_len or 0)
-        if self._use_simple_fsdp or self.parallel_dims.cp_enabled or static_len or static_response_len:
+        slot_len = int(getattr(self, "_gdn_row_slot_len", 0) or 0)
+        if self._use_simple_fsdp or self.parallel_dims.cp_enabled or static_len or static_response_len or slot_len:
             align_micro_batch_shapes_across_ranks(
                 micro_batches,
                 bucket_size=get_tpu_seq_bucket_size(self.engine_config),
                 static_len=static_len,
                 static_response_len=static_response_len,
+                gdn_row_slot_len=slot_len,
             )
 
-        if "kda" in getattr(self, "_tpu_kernels", ()):
+        if "kda" in getattr(self, "_tpu_kernels", ()) and not getattr(self, "_gdn_row_slot_len", 0):
             # Only with Tokamax's GatedDeltaNet kernels (google-pytorch/torchtitan#74): every sequence of a
             # micro-batch is one packed document, plus the bucket-padding tail; bucketed so that use_dynamic_bsz's
             # varying sequence counts do not recompile the kernels (see packed_document_budget).
@@ -1508,7 +1563,13 @@ class TorchTitanTPUEngine(BaseEngine):
             else nullcontext()
         )
 
-        with timeline_ctx, tpu_eager_mode_context(self._tpu_eager_mode):
+        if getattr(self, "_gdn_row_slot_len", 0):
+            from torchtitan.experiments.tpu.unflatten_shim import set_unflatten_seq_len
+
+            row_ctx = set_unflatten_seq_len(self._gdn_row_slot_len)
+        else:
+            row_ctx = nullcontext()
+        with timeline_ctx, tpu_eager_mode_context(self._tpu_eager_mode), row_ctx:
             for micro_batch_idx, micro_batch in enumerate(micro_batches):
                 with self.trainer.train_context(), ctx, torch.profiler.record_function(f"micro_batch{micro_batch_idx}"):
                     loss, output = self.forward_step(
@@ -1587,6 +1648,8 @@ class TorchTitanTPUEngine(BaseEngine):
             timeline.span("optimizer_step", group=timeline.TRAINER_WORKERS, lane=timeline.trainer_lane()),
             tpu_eager_mode_context(self._tpu_eager_mode),
         ):
+            for p in getattr(self, "_frozen_params", ()):
+                p.grad = None  # frozen: out of the gradient norm, and AdamW skips parameters without a gradient
             param_chunks = self._optimizer_param_chunks()
             grad_norm = self._chunked_grad_norm(param_chunks)
             tpu_synchronize(grad_norm, wait=True)
@@ -2172,6 +2235,7 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
         bucket_size = get_tpu_seq_bucket_size(self.engine_config)
         if use_remove_padding:
             vocab_size = getattr(get_text_config(self.model_config.hf_config), "vocab_size", None)
+            cu_seqlens = input_ids.offsets()
             input_ids, position_ids, labels, orig_seq_len = pad_packed_inputs_for_tpu(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -2181,6 +2245,12 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
                 vocab_size=vocab_size,
             )
             output_args["orig_seq_len"] = orig_seq_len
+            if getattr(self, "_gdn_row_slot_len", 0):
+                # One sequence per GatedDeltaNet row; prepare_model_outputs restores the packed order.
+                slot_src, contig_src = row_slot_permutation(cu_seqlens, input_ids.shape[-1], self._gdn_row_slot_len)
+                slot_src = slot_src.to(input_ids.device)
+                input_ids, position_ids = input_ids[..., slot_src], position_ids[..., slot_src]
+                output_args["gdn_contig_src"] = contig_src.to(input_ids.device)
         else:
             pad_token_id = tu.get_non_tensor_data(data=micro_batch, key="pad_token_id", default=0)
             batch_size = micro_batch.batch_size[0]
@@ -2303,6 +2373,9 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
         fused_log_probs = None
         if isinstance(logits, tuple):
             hidden_states, lm_head_weight_t = logits
+            if "gdn_contig_src" in output_args:
+                # gdn_row_slot_len: back from one sequence per row to the packed token order.
+                hidden_states = hidden_states.index_select(-2, output_args["gdn_contig_src"])
             if use_remove_padding and not self.parallel_dims.tp_enabled:
                 if labels.dim() > 1:
                     labels = labels.squeeze(0)
@@ -2444,8 +2517,50 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanTPUEngine):
                 if loss_function is not None:
                     loss_model_output, loss_data = prepare_tpu_loss_inputs(model_output, micro_batch)
                     loss, metrics = loss_function(
-                        model_output=loss_model_output, data=loss_data, dp_group=self.get_data_parallel_group()
+                        model_output=loss_model_output,
+                        data=loss_data,
+                        dp_group=self.get_data_parallel_group(),
                     )
+                    names = (
+                        "actor/ppo_kl_token_mean",
+                        "actor/ppo_k3_token_mean",
+                        "actor/logprob_gap_abs_token_mean",
+                    )
+                    if (
+                        isinstance(loss_function, partial)
+                        and loss_function.func is ppo_loss
+                        and any(name not in metrics for name in names)
+                    ):
+                        config = loss_function.keywords.get("config")
+                        if config is None and loss_function.args:
+                            config = loss_function.args[0]
+                        if config is not None and config.global_batch_info.get("batch_num_tokens") is not None:
+                            mode = config.policy_loss.get("loss_mode", "vanilla")
+                            correction = config.policy_loss.get("rollout_correction") or {}
+                            # Rejection sampling and other losses use a different token denominator.
+                            if mode == "vanilla" or (
+                                mode == "bypass_mode"
+                                and correction.get("loss_type", "ppo_clip") == "ppo_clip"
+                                and correction.get("rollout_rs") is None
+                            ):
+                                with torch.no_grad():
+                                    log_prob = no_padding_2_padding(loss_model_output["log_probs"], loss_data)
+                                    fields = loss_data.select("old_log_probs", "response_mask").to_padded_tensor()
+                                    mask = fields["response_mask"]
+                                    gap = torch.where(
+                                        mask.bool(), log_prob.float() - fields["old_log_probs"].float(), 0.0
+                                    )
+                                    ratio = gap.clamp(-20.0, 20.0)
+                                    values = (-ratio, (ratio.exp() - ratio - 1.0).clamp_min(0.0), gap.abs())
+                                    # SUM micro-batches, then MEAN DP ranks: global token means.
+                                    for name, value in zip(names, values, strict=True):
+                                        metrics.setdefault(
+                                            name,
+                                            Metric(
+                                                AggregationType.SUM,
+                                                agg_loss(value, mask, "token-mean", **config.global_batch_info),
+                                            ),
+                                        )
                 else:
                     assert forward_only, "loss_function must be provided when not forward_only"
                     loss = torch.tensor(1.0, device=device_name)

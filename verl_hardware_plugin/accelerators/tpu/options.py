@@ -154,6 +154,12 @@ class TPUEngineOptions:
         ep_capacity_factor: Per-destination-rank token capacity multiplier of the TPU EP token dispatcher when
             ``expert_parallel_size > 1`` (default: ``4.0``). torchtitan's pretraining default (``1.25``) drops
             skewed RL / math tokens across 32-64 EP ranks while vLLM rollout is dropless.
+        qwen3_pallas_experts: Legacy Qwen3-30B-A3B flag; Pallas is required, so ``False`` is rejected.
+        moe_paired_gemm: Legacy Qwen3-30B-A3B alias used only when ``moe_paired_grouped_mm`` is unset.
+        mixed_precision_param: TorchTitan mixed-precision parameter dtype, ``bfloat16`` or ``float32``;
+            unset preserves its default and FP32 master parameters.
+        fp32_logits: Preserve FP32 LM-head accumulators with BF16 operands; ``False`` requests BF16 logits.
+            Either explicit value disables the automatic fused-linear-loss default so this head is used.
         rollout_expert_parallel: Export Qwen3.5 MoE experts in vLLM's expert-parallel layout so the rollout
             receives them straight into its expert weights with no HBM staging copy (default: ``False``, see
             ``rollout/qwen3_5_layout.py``). Temporary for large MoEs whose expert shard cannot afford a second HBM
@@ -203,6 +209,13 @@ class TPUEngineOptions:
             matmul, sharing the routed-token loads (default: ``False``).
         moe_native_weight_layout: Qwen3 MoE: store the expert weights in the kernel-native ``(E, K, N)`` layout;
             ``state_dict()`` / ``load_state_dict()`` still use the canonical layout and names (default: ``False``).
+        gdn_row_slot_len: Qwen3.5: start every sequence of a packed micro-batch at a multiple of this many tokens
+            and run the GatedDeltaNet over rows of this length (one sequence per row) instead of restarting it at
+            packed documents through Tokamax ``segment_ids`` (default: unset, off). Needs every sequence <= this
+            length and ``static_micro_batch_len`` = sequences per micro-batch x this.
+        frozen_param_regex: Parameters whose FQN matches this regex (``re.search``) are not trained: their
+            gradients are dropped before the gradient norm and the optimizer step, e.g. ``moe.router.gate`` freezes
+            the MoE router (default: unset, train every parameter).
     """
 
     use_splash_attention: Optional[bool] = None
@@ -215,6 +228,10 @@ class TPUEngineOptions:
     seq_bucket_size: Optional[int] = None
     model_kernels: Optional[str] = None
     ep_capacity_factor: Optional[float] = None
+    qwen3_pallas_experts: Optional[bool] = None
+    moe_paired_gemm: Optional[bool] = None
+    mixed_precision_param: Optional[str] = None
+    fp32_logits: Optional[bool] = None
     rollout_expert_parallel: Optional[bool] = None
     param_dtype: Optional[str] = None
     optimizer_host_offload: Optional[bool] = None
@@ -230,6 +247,8 @@ class TPUEngineOptions:
     mixed_precision_reduce: Optional[str] = None
     moe_paired_grouped_mm: Optional[bool] = None
     moe_native_weight_layout: Optional[bool] = None
+    gdn_row_slot_len: Optional[int] = None
+    frozen_param_regex: Optional[str] = None
 
 
 _ENGINE_KINDS: dict[str, type] = {
@@ -243,6 +262,10 @@ _ENGINE_KINDS: dict[str, type] = {
     "seq_bucket_size": int,
     "model_kernels": str,
     "ep_capacity_factor": float,
+    "qwen3_pallas_experts": bool,
+    "moe_paired_gemm": bool,
+    "mixed_precision_param": str,
+    "fp32_logits": bool,
     "rollout_expert_parallel": bool,
     "param_dtype": str,
     "optimizer_host_offload": bool,
@@ -258,6 +281,8 @@ _ENGINE_KINDS: dict[str, type] = {
     "mixed_precision_reduce": str,
     "moe_paired_grouped_mm": bool,
     "moe_native_weight_layout": bool,
+    "gdn_row_slot_len": int,
+    "frozen_param_regex": str,
 }
 assert set(_ENGINE_KINDS) == {f.name for f in dataclasses.fields(TPUEngineOptions)}
 
@@ -269,6 +294,9 @@ _ENGINE_LEGACY_ENV_VARS = {
     "tpu_eager_mode": "VERL_TPU_EAGER_MODE",
     "optim_impl": "VERL_TPU_OPTIM_IMPL",
     "seq_bucket_size": "VERL_TPU_SEQ_BUCKET_SIZE",
+    "qwen3_pallas_experts": "VERL_TPU_QWEN3_PALLAS_EXPERTS",
+    "moe_paired_gemm": "VERL_MOE_PAIRED_GEMM",
+    "fp32_logits": "VERL_TPU_FP32_LOGITS",
 }
 _ENGINE_LEGACY_CONFIG_FIELDS = (
     "use_splash_attention",
@@ -276,6 +304,8 @@ _ENGINE_LEGACY_CONFIG_FIELDS = (
     "use_fused_linear_cross_entropy",
     "fuse_qkv",
     "tpu_eager_mode",
+    "mixed_precision_param",
+    "fp32_logits",
 )
 
 
@@ -305,6 +335,9 @@ def get_tpu_engine_options(engine_config: Any) -> TPUEngineOptions:
     _apply_legacy_env(
         values, _ENGINE_KINDS, _ENGINE_LEGACY_ENV_VARS, f"torchtitan.engine_kwargs.{TPU_ENGINE_KWARGS_KEY}"
     )
+    mixed_precision_param = values.get("mixed_precision_param")
+    if mixed_precision_param not in (None, "bfloat16", "float32"):
+        raise ValueError("TPU engine mixed_precision_param must be bfloat16, float32, or null")
     if values.get("param_dtype") not in (None, "float32", "bfloat16"):
         raise ValueError(
             f"engine_kwargs.{TPU_ENGINE_KWARGS_KEY}.param_dtype must be float32 or bfloat16, "
@@ -375,15 +408,21 @@ class TPUSyncOptions:
         return_after_d2h: Return to the trainer as soon as its weights are copied to host memory, and finish the sync
             (the transfer to the rollout hosts, the install and the resume) in the background while training goes on.
             The next sync waits for it first. Applies from the second sync on and needs a ``tpu-sync-torch`` whose
-            ``WeightSynchronizer.d2h()`` returns a future. Off by default: it relies on verl waiting for a pending
-            update (``CheckpointEngineManager.wait_for_weight_update``) before validation and at the end of training.
+            ``WeightSynchronizer.d2h()`` returns a future (verl#8626); with an older ``tpu-sync-torch`` the sync runs
+            to the end as before. Relies on ``CheckpointEngineManager.wait_for_weight_update`` (verl#8530) before
+            validation and at the end of training.
+        receive_into_vllm: The rollout receives every tensor straight into vLLM's parameters, with no HBM staging
+            copy. The trainer exports its weights in vLLM's layout (fused, transposed, one virtual tensor per vLLM
+            parameter), so each rollout rank's TP slice is its vLLM weight. Dense models with FSDP degree equal to
+            the rollout TP degree only, for now (see ``weight_sync/vllm_layout.py``).
     """
 
     parallelism: int = TPU_SYNC_DEFAULT_PARALLELISM
     verify_parity: str = "off"
     release_buffers_after_sync: bool = True
     tie_word_embeddings: Optional[bool] = None
-    return_after_d2h: bool = False
+    return_after_d2h: bool = True
+    receive_into_vllm: bool = False
 
     @property
     def verify_norms(self) -> bool:
@@ -401,6 +440,7 @@ _SYNC_KINDS: dict[str, type] = {
     "verify_parity": ParityMode,
     "release_buffers_after_sync": bool,
     "tie_word_embeddings": bool,
+    "receive_into_vllm": bool,
     "return_after_d2h": bool,
 }
 assert set(_SYNC_KINDS) == {f.name for f in dataclasses.fields(TPUSyncOptions)}

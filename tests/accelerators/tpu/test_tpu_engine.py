@@ -828,13 +828,52 @@ def test_fused_logprob_chunked_backward_matches_autograd():
         xk, wk = x.clone().requires_grad_(), weight_t.clone().requires_grad_()
         with (
             mock.patch.object(fused_logprob, "_forward_op", _forward_op),
-            mock.patch.object(fused_logprob, "BACKWARD_CHUNK", 4),  # several chunks, the last one ragged
+            # Several vocab chunks (30 columns in chunks of 8), the last one ragged; labels fall in every chunk.
+            mock.patch.object(fused_logprob, "backward_vocab_chunk", lambda num_tokens, vocab: 8),
         ):
             logp = fused_logprob.fused_linear_logprobs_tpu(xk, labels, wk, temperature=temperature, b_block_size=16)
         (logp * cotangent).sum().backward()
         torch.testing.assert_close(logp, expected.detach())
         torch.testing.assert_close(xk.grad, xr.grad, rtol=1e-4, atol=1e-5)
         torch.testing.assert_close(wk.grad, wr.grad, rtol=1e-4, atol=1e-5)
+
+
+def test_fused_logprob_backward_never_holds_the_whole_fp32_lm_head():
+    """The backward's largest temporaries are one [T, Vc] FP32 logits chunk and the [H, Vc] FP32 weight slice: it
+    must not make an FP32 copy of the whole (H, V) LM head or of its gradient (2 x 2.3 GiB for Qwen3-8B)."""
+    from verl_hardware_plugin.accelerators.tpu.engines import fused_logprob
+
+    # Qwen3-8B: 4096 x 151936 at 8192 tokens -> 512 MiB chunks of 16384 columns; a small vocab is one chunk.
+    assert fused_logprob.backward_vocab_chunk(8192, 151936) == 16384
+    assert fused_logprob.backward_vocab_chunk(65536, 151936) == 2048
+    assert fused_logprob.backward_vocab_chunk(1 << 20, 151936) == fused_logprob.BACKWARD_MIN_VOCAB_CHUNK
+    assert fused_logprob.backward_vocab_chunk(16, 30) == 30
+
+    torch.manual_seed(0)
+    tokens, hidden, vocab = 64, 16, 4096
+    x = torch.randn(tokens, hidden, dtype=torch.bfloat16)
+    weight_t = (torch.randn(hidden, vocab) * 0.3).to(torch.bfloat16)
+    labels = torch.randint(0, vocab, (tokens,))
+    lse = torch.logsumexp(x.float() @ weight_t.float(), -1)
+    sizes: list[int] = []
+
+    class _Ctx:
+        saved_tensors = (x, labels.to(torch.int32), weight_t, lse)
+
+    real_float = torch.Tensor.float
+
+    def counting_float(t):
+        sizes.append(t.numel())
+        return real_float(t)
+
+    with (
+        mock.patch.object(fused_logprob, "backward_vocab_chunk", lambda num_tokens, v: 512),
+        mock.patch.object(torch.Tensor, "float", counting_float),
+    ):
+        grad_x, _, grad_w, _ = fused_logprob._FusedLogprob.backward(_Ctx, torch.ones(tokens))
+    assert grad_x.shape == x.shape and grad_w.shape == weight_t.shape and grad_w.dtype == weight_t.dtype
+    # No FP32 conversion of a (H, V)-sized tensor; the weight is converted one 512-column slice at a time.
+    assert max(sizes) <= max(tokens * hidden, hidden * 512)
 
 
 def test_fused_log_prob_is_required_for_moe():
@@ -1447,6 +1486,42 @@ def test_chunked_optimizer_step_matches_unchunked_adamw():
         torch.testing.assert_close(pa, pb, rtol=1e-6, atol=1e-6)
         assert pa.grad is None
     assert opt_a.param_groups[0]["params"] == params_a
+
+
+def test_optimizer_step_skips_frozen_params():
+    """``frozen_param_regex`` parameters stay unchanged and are left out of the gradient norm."""
+    from verl_hardware_plugin.accelerators.tpu.engines.torchtitan_tpu import TorchTitanTPUEngine
+
+    gen = torch.Generator().manual_seed(0)
+    names = [f"layers.{i}.moe.router.gate.weight" for i in range(2)] + [f"layers.{i}.wq.weight" for i in range(2)]
+    params_a = [torch.nn.Parameter(torch.randn(4, 4, generator=gen)) for _ in names]
+    params_b = [torch.nn.Parameter(p.detach().clone()) for p in params_a[2:]]
+    for i, pa in enumerate(params_a):
+        pa.grad = torch.randn(4, 4, generator=gen)
+        if i >= 2:
+            params_b[i - 2].grad = pa.grad.clone()
+    frozen_before = [p.detach().clone() for p in params_a[:2]]
+
+    opt_a = torch.optim.AdamW([{"params": params_a, "param_names": names, "lr": 1e-2}])
+    opt_b = torch.optim.AdamW([{"params": params_b, "lr": 1e-2}])
+    ref_norm = torch.nn.utils.clip_grad_norm_(params_b, max_norm=1.0, foreach=False).item()
+    opt_b.step()
+
+    fake_engine = SimpleNamespace(
+        _tpu_eager_mode=None,
+        _frozen_params=params_a[:2],
+        module=[SimpleNamespace(named_parameters=lambda: list(zip(names, params_a, strict=True)))],
+        optimizer=SimpleNamespace(optimizers=[opt_a], zero_grad=opt_a.zero_grad),
+        parallel_dims=SimpleNamespace(ep_enabled=False, get_optional_mesh=lambda _: None),
+        config=SimpleNamespace(training=SimpleNamespace(max_norm=1.0)),
+    )
+    for helper in ("_optimizer_param_chunks", "_chunked_grad_norm", "_chunked_clip_and_step"):
+        setattr(fake_engine, helper, getattr(TorchTitanTPUEngine, helper).__get__(fake_engine))
+    assert TorchTitanTPUEngine.optimizer_step(fake_engine) == pytest.approx(ref_norm, rel=1e-6)
+    for p, before in zip(params_a[:2], frozen_before, strict=True):
+        torch.testing.assert_close(p.detach(), before, rtol=0, atol=0)
+    for pa, pb in zip(params_a[2:], params_b, strict=True):
+        torch.testing.assert_close(pa, pb, rtol=1e-6, atol=1e-6)
 
 
 @pytest.mark.parametrize("host_offload", [False, True])
@@ -3411,3 +3486,39 @@ def test_save_checkpoint_honors_save_contents_and_async_save(
     if async_save:
         tracker_file = tmp_path / "ckpts" / "latest_checkpointed_iteration.txt"
         assert tracker_file.read_text(encoding="utf-8") == "7"
+
+
+def test_row_slot_permutation():
+    from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import row_slot_permutation
+
+    slot_src, contig_src = row_slot_permutation(torch.tensor([0, 5, 12, 13]), padded_len=32, slot_len=8)
+    slots = torch.arange(32)[slot_src]
+    assert torch.equal(slots[contig_src], torch.arange(32))
+    # Sequence i starts at token i * slot_len; padding tokens (>= 13) fill the rest.
+    assert torch.equal(slots[0:5], torch.arange(0, 5))
+    assert torch.equal(slots[8:15], torch.arange(5, 12))
+    assert torch.equal(slots[16:17], torch.arange(12, 13))
+    for cu_seqlens, padded_len in (([0, 9], 32), ([0, 1, 2, 3, 4, 5], 32), ([0, 5], 30)):
+        with pytest.raises(ValueError, match="gdn_row_slot_len"):
+            row_slot_permutation(torch.tensor(cu_seqlens), padded_len, slot_len=8)
+
+
+def test_align_micro_batch_shapes_gdn_row_slot_len_multi_seq():
+    from verl_hardware_plugin.accelerators.tpu.engines import tpu_utils
+
+    seq_lens = [22000, 18000, 25000, 19000]  # 84000 real tokens across 4 sequences (> static_len=32768)
+    ids = torch.nested.as_nested_tensor([torch.arange(n, dtype=torch.int64) for n in seq_lens], layout=torch.jagged)
+    pos = torch.nested.as_nested_tensor([torch.arange(n, dtype=torch.int64) for n in seq_lens], layout=torch.jagged)
+    mb4 = TensorDict({"input_ids": ids, "position_ids": pos}, batch_size=[4])
+
+    tpu_utils.align_micro_batch_shapes_across_ranks([mb4], bucket_size=2048, static_len=32768, gdn_row_slot_len=32768)
+    assert tu.get_non_tensor_data(mb4, "tpu_padded_seq_len", None) == 4 * 32768
+    ids_pad, pos_pad, _, orig_len = pad_packed_inputs_for_tpu(
+        ids, pos, mb4, torch.device("cpu"), bucket_size=2048, vocab_size=248320
+    )
+    assert orig_len == sum(seq_lens)
+    assert ids_pad.shape == (4 * 32768,)
+    slot_src, contig_src = tpu_utils.row_slot_permutation(ids.offsets(), ids_pad.shape[-1], 32768)
+    slotted = ids_pad[slot_src]
+    restored = slotted[contig_src]
+    assert torch.equal(restored[:orig_len], ids.values())
