@@ -10,7 +10,7 @@ import json
 import os
 import sys
 import types
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -804,6 +804,28 @@ def test_auto_assign_accelerator_type_fills_unequal_rollout_slices_by_capacity(t
         assert platform.auto_assign_accelerator_type("global_pool", None) == trainer
         claimed = [platform.auto_assign_accelerator_type(f"rollout_pool_{r}", None) for r in range(3)]
     assert claimed == [slice_a, slice_b, slice_b]
+
+
+def test_auto_assign_accelerator_type_is_thread_safe_under_concurrency():
+    platform = PlatformTPU()
+    nodes = [{"Alive": True, "Resources": {"TPU": 8.0, f"tpu-group-{g}": 1.0}} for g in range(5)]
+    with (
+        mock.patch("ray.is_initialized", return_value=True),
+        mock.patch("ray.nodes", return_value=nodes),
+    ):
+        assert platform.auto_assign_accelerator_type("global_pool", None) == "tpu-group-0"
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            claimed = list(
+                pool.map(lambda r: platform.auto_assign_accelerator_type(f"rollout_pool_{r}", None), range(16))
+            )
+    assert "tpu-group-0" not in claimed
+    assert {s: claimed.count(s) for s in set(claimed)} == {f"tpu-group-{g}": 4 for g in range(1, 5)}
+
+
+def test_tpu_forwarded_env_vars_include_quantize_on_load_prefixes():
+    from verl_hardware_plugin.accelerators.tpu.platform_tpu import TPU_FORWARDED_ENV_VARS
+
+    assert "QUANTIZE_ON_LOAD_PREFIXES" in TPU_FORWARDED_ENV_VARS
 
 
 def test_rollout_replica_kind_is_the_pool_name_without_the_rank():

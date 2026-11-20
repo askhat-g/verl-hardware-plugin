@@ -28,8 +28,10 @@ import fcntl
 import inspect
 import logging
 import os
+import random
 import socket
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 import ray
 
@@ -77,6 +79,8 @@ SUBHOST_CLAIM_FILE = "/tmp/verl_tpu_subhost_rollout.lock"
 _CONTROLLER_ID = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 # Attempts to take over a claim that names another controller (see claim_host_for_subhost_engines).
 _CLAIM_ATTEMPTS = 3
+_REPLICA_INIT_EXECUTOR = ThreadPoolExecutor(max_workers=32, thread_name_prefix="tpu-replica-init")
+_SERVER_LAUNCH_MAX_ATTEMPTS = 3
 
 # {node id: {engine: slot}} and {node id: devices per engine} of the engines that share a host. Every replica of a
 # job is launched from this process (asyncio.gather), so the table sees all the engines of a host. A slot, once
@@ -292,7 +296,8 @@ class TPUvLLMReplica(vLLMReplica):
             and self.nnodes == 1
             and "resource_pool" in inspect.signature(super().init_standalone).parameters
         ):
-            resource_pool = self._single_host_pool()
+            loop = asyncio.get_running_loop()
+            resource_pool = await loop.run_in_executor(_REPLICA_INIT_EXECUTOR, self._single_host_pool)
         if resource_pool is None:
             await super().init_standalone()
         else:
@@ -357,6 +362,43 @@ class TPUvLLMReplica(vLLMReplica):
                 )
         return env_vars
 
+    async def _cleanup_failed_servers(self) -> None:
+        """Kill partial server actors of this replica and wait for Ray GCS name cleanup before retry."""
+        for server in getattr(self, "servers", []) or []:
+            try:
+                ray.kill(server, no_restart=True)
+            except Exception:
+                pass
+        self.servers = []
+
+        if not ray.is_initialized():
+            return
+        names = [self._server_actor_name(node_rank) for node_rank in range(self.nnodes)]
+        for name in names:
+            try:
+                actor = ray.get_actor(name)
+            except Exception:
+                continue
+            try:
+                ray.kill(actor, no_restart=True)
+            except Exception:
+                pass
+
+        for _ in range(50):
+            still_alive = False
+            for name in names:
+                try:
+                    ray.get_actor(name)
+                    still_alive = True
+                    break
+                except ValueError:
+                    pass
+                except Exception:
+                    pass
+            if not still_alive:
+                return
+            await asyncio.sleep(0.2)
+
     async def launch_servers(self):
         if self.config.data_parallel_size > 1:
             raise NotImplementedError(
@@ -388,4 +430,23 @@ class TPUvLLMReplica(vLLMReplica):
                     "replicas. verl places rollout workers with Ray's best-effort PACK strategy (bin_pack=False), "
                     "which can split a replica over partly used hosts."
                 )
-        await super().launch_servers()
+        for attempt in range(1, _SERVER_LAUNCH_MAX_ATTEMPTS + 1):
+            try:
+                await super().launch_servers()
+                return
+            except (NotImplementedError, ValueError):
+                raise
+            except Exception as exc:
+                await self._cleanup_failed_servers()
+                if attempt == _SERVER_LAUNCH_MAX_ATTEMPTS:
+                    raise
+                delay = 2.0 + random.uniform(0.0, 2.0)
+                logger.warning(
+                    "Rollout replica %s launch_servers attempt %d/%d failed (%s); retrying in %.1fs",
+                    self.replica_rank,
+                    attempt,
+                    _SERVER_LAUNCH_MAX_ATTEMPTS,
+                    exc,
+                    delay,
+                )
+                await asyncio.sleep(delay)

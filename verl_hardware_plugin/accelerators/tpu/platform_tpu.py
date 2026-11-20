@@ -18,6 +18,7 @@ import logging
 import math
 import os
 import re
+import threading
 from contextlib import contextmanager
 from typing import Any, Callable, Mapping, Optional, Sequence
 
@@ -58,7 +59,13 @@ _ensure_torch_tpu()  # Attempt at module load time so availability checks are fa
 # read: the libtpu / XLA compiler flags, and the plugin's own knobs (``VERL_TPU_*``, including ``VERL_TPU_SYNC_*``). Ray
 # workers start from the raylet's environment, not the driver's, so the platform names them in the job's
 # runtime_env for them to reach the trainer workers, the rollout servers and vLLM's engine workers.
-TPU_FORWARDED_ENV_VARS = ("LIBTPU_INIT_ARGS", "XLA_FLAGS", "VERL_MOE_PAIRED_GEMM", "TORCH_TPU_TOPOLOGY")
+TPU_FORWARDED_ENV_VARS = (
+    "LIBTPU_INIT_ARGS",
+    "XLA_FLAGS",
+    "VERL_MOE_PAIRED_GEMM",
+    "TORCH_TPU_TOPOLOGY",
+    "QUANTIZE_ON_LOAD_PREFIXES",
+)
 TPU_FORWARDED_ENV_PREFIXES = ("VERL_TPU_",)
 # Extra ``LIBTPU_INIT_ARGS`` / ``XLA_FLAGS`` appended only on ``RayWorkerGroup`` trainer/reference workers (never on
 # vLLM rollout servers), e.g. ``--xla_tpu_scoped_vmem_limit_kib=65472``, TorchTitan's MoE SparseCore collective-offload
@@ -774,6 +781,7 @@ class PlatformTPU(PlatformBase):
         original_tpu = getattr(torch, "tpu", DummyTpuDeviceModule())
         # torch.tpu itself is left untouched; the proxy adds what verl needs (see TPUDeviceModuleProxy).
         self._device_module = TPUDeviceModuleProxy(original_tpu)
+        self._slice_lock = threading.Lock()
         self._claimed_slices: set[str] = set()
         # Per rollout replica kind (see rollout_replica_kind): {slice: replicas placed on it} for the slices its
         # replicas claimed, in claim order.
@@ -960,20 +968,22 @@ class PlatformTPU(PlatformBase):
                     ),
                 )
                 kind = rollout_replica_kind(name_prefix)
-                for tpu_slice in slices:
-                    if tpu_slice not in self._claimed_slices:
-                        self._claimed_slices.add(tpu_slice)
-                        if kind is not None:
-                            self._rollout_slices.setdefault(kind, {})[tpu_slice] = 1
-                        return tpu_slice
-                if kind is not None:
-                    own_slices = {s: n for s, n in self._rollout_slices.get(kind, {}).items() if s in tpu_slices}
-                    if own_slices:
-                        # Stacking the remaining replicas on one slice would ask it for more devices than it has,
-                        # and their placement groups would never be scheduled. min() keeps the first claimed on a tie.
-                        tpu_slice = min(own_slices, key=lambda s: own_slices[s] / (slice_devices.get(s) or 1.0))
-                        self._rollout_slices[kind][tpu_slice] += 1
-                        return tpu_slice
+                with self._slice_lock:
+                    for tpu_slice in slices:
+                        if tpu_slice not in self._claimed_slices:
+                            self._claimed_slices.add(tpu_slice)
+                            if kind is not None:
+                                self._rollout_slices.setdefault(kind, {})[tpu_slice] = 1
+                            return tpu_slice
+                    if kind is not None:
+                        own_slices = {s: n for s, n in self._rollout_slices.get(kind, {}).items() if s in tpu_slices}
+                        if own_slices:
+                            # Stacking the remaining replicas on one slice would ask it for more devices than it has,
+                            # and their placement groups would never be scheduled. min() keeps the first claimed on a
+                            # tie.
+                            tpu_slice = min(own_slices, key=lambda s: own_slices[s] / (slice_devices.get(s) or 1.0))
+                            self._rollout_slices[kind][tpu_slice] += 1
+                            return tpu_slice
                 if slices:
                     return slices[-1]
         except Exception as e:
