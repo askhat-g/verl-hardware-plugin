@@ -637,6 +637,11 @@ class TPUSyncOptions:
             received with the rollout's own quantizer and writes the live weights and scales (``True``, default).
             ``False`` installs them through vLLM's checkpoint loaders instead (every rank all-gathers every tensor;
             much slower), e.g. to rule out the direct install while debugging.
+        use_data_nics: Whether ``WeightSynchronizer`` leaves ``bind_ip`` unset so tpu-sync discovers all jumbo-frame
+            NICs (`True`), pins ``bind_ip`` to the control/node IP (`False`), or decides automatically (`None`,
+            default): pinning to the control IP when jumbo-frame NICs span multiple NUMA nodes and the control NIC
+            already uses jumbo frames (e.g. TPU v7x with isolated per-NUMA VPC subnets), and letting tpu-sync
+            discover data NICs otherwise (e.g. TPU v6e).
     """
 
     parallelism: int = TPU_SYNC_DEFAULT_PARALLELISM
@@ -647,6 +652,7 @@ class TPUSyncOptions:
     return_after_d2h: bool = True
     receive_into_vllm: str = "auto"
     direct_install_quantized_moe: bool = True
+    use_data_nics: Optional[bool] = None
 
     @property
     def verify_norms(self) -> bool:
@@ -668,6 +674,7 @@ _SYNC_KINDS: dict[str, type] = {
     "receive_into_vllm": ReceiveIntoVllmMode,
     "return_after_d2h": bool,
     "direct_install_quantized_moe": bool,
+    "use_data_nics": bool,
 }
 assert set(_SYNC_KINDS) == {f.name for f in dataclasses.fields(TPUSyncOptions)}
 

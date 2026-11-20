@@ -305,6 +305,69 @@ def test_replica_launch_servers_delegates_to_upstream_and_rejects_data_parallel(
         asyncio.run(_make_tpu_replica(tpu_vllm, data_parallel_size=2).launch_servers())
 
 
+def test_replica_launch_servers_retries_transient_failures_and_cleans_actors(tpu_vllm):
+    replica = _make_tpu_replica(tpu_vllm, replica_rank=2, nnodes=1, chips_per_host=8)
+    attempts = 0
+    killed = []
+    actor_lookups = {"remaining": 1}
+
+    async def flaky_launch(self):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            self.servers = [f"handle_{attempts}"]
+            raise RuntimeError(f"transient failure #{attempts}")
+        self.launched = True
+
+    def fake_get_actor(name):
+        assert name == replica._server_actor_name(0)
+        if actor_lookups["remaining"] > 0:
+            actor_lookups["remaining"] -= 1
+            return "named_actor_handle"
+        raise ValueError("not found")
+
+    async def fast_sleep(_delay):
+        pass
+
+    with (
+        mock.patch.object(_FakeReplica, "launch_servers", flaky_launch),
+        mock.patch("ray.is_initialized", return_value=True),
+        mock.patch("ray.get_actor", side_effect=fake_get_actor),
+        mock.patch("ray.kill", side_effect=lambda handle, no_restart=True: killed.append((handle, no_restart))),
+        mock.patch.object(tpu_vllm.asyncio, "sleep", side_effect=fast_sleep),
+    ):
+        asyncio.run(replica.launch_servers())
+
+    assert attempts == 3
+    assert replica.launched is True
+    assert ("handle_1", True) in killed
+    assert ("handle_2", True) in killed
+    assert ("named_actor_handle", True) in killed
+
+
+def test_replica_launch_servers_raises_after_max_attempts(tpu_vllm):
+    replica = _make_tpu_replica(tpu_vllm, replica_rank=1, nnodes=1, chips_per_host=8)
+    attempts = 0
+
+    async def always_fail(self):
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("persistent error")
+
+    async def fast_sleep(_delay):
+        pass
+
+    with (
+        mock.patch.object(_FakeReplica, "launch_servers", always_fail),
+        mock.patch("ray.is_initialized", return_value=False),
+        mock.patch.object(tpu_vllm.asyncio, "sleep", side_effect=fast_sleep),
+        pytest.raises(RuntimeError, match="persistent error"),
+    ):
+        asyncio.run(replica.launch_servers())
+
+    assert attempts == tpu_vllm._SERVER_LAUNCH_MAX_ATTEMPTS
+
+
 @pytest.mark.parametrize("chips", [4, 8])
 def test_replica_launch_servers_rejects_a_single_host_replica_split_across_hosts(tpu_vllm, chips):
     # Ray's best-effort PACK put half of a single-host replica's workers on another host. Upstream launch_servers

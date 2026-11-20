@@ -32,12 +32,16 @@ carry model weights in the clear. Run them only on a trusted cluster network.
 
 import asyncio
 import concurrent.futures
+import fcntl
 import gc
 import logging
 import os
+import socket
+import struct
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from pathlib import Path
 from typing import Any, Optional
 
 import ray
@@ -109,6 +113,61 @@ def create_torch_weight_synchronizer(
 
 
 _UNROUTABLE_HOSTS = ("", "0.0.0.0", "::", "127.0.0.1", "::1", "localhost")
+_STANDARD_ETHERNET_MTU = 1500
+_SIOCGIFADDR = 0x8915
+
+
+def _interface_ipv4(iface: str) -> Optional[str]:
+    """Return the IPv4 address bound to Linux network interface ``iface``, or ``None``."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            packed = fcntl.ioctl(sock.fileno(), _SIOCGIFADDR, struct.pack("256s", iface[:15].encode()))
+        return socket.inet_ntoa(packed[20:24])
+    except OSError:
+        return None
+
+
+def resolve_sync_bind_ip(
+    node_ip: str,
+    use_data_nics: Optional[bool] = None,
+    *,
+    net_root: Path = Path("/sys/class/net"),
+    iface_ip_fn: Callable[[str], Optional[str]] = _interface_ipv4,
+) -> Optional[str]:
+    """Decide ``bind_ip`` for ``create_torch_weight_synchronizer`` from ``use_data_nics`` and host NIC layout.
+
+    When ``use_data_nics`` is ``False``, pins every worker to ``node_ip``. When ``True``, leaves ``bind_ip``
+    unset so ``tpu-sync`` selects jumbo-frame NICs per TPU NUMA node. When ``None`` (auto), pins to ``node_ip``
+    if ``node_ip`` already sits on a jumbo-frame interface (`MTU > 1500`) and jumbo-frame interfaces span
+    multiple NUMA nodes (e.g. TPU v7x where NUMA-0 and NUMA-1 NICs sit on isolated VPC subnets).
+    """
+    if use_data_nics is False:
+        return node_ip
+    if use_data_nics is True:
+        return None
+    if not net_root.is_dir():
+        return None
+
+    jumbo_numas: set[int] = set()
+    node_ip_jumbo = False
+    for entry in net_root.iterdir():
+        if entry.name == "lo":
+            continue
+        try:
+            mtu = int((entry / "mtu").read_text().strip())
+        except (OSError, ValueError):
+            continue
+        if mtu <= _STANDARD_ETHERNET_MTU:
+            continue
+        if iface_ip_fn(entry.name) == node_ip:
+            node_ip_jumbo = True
+        try:
+            numa = int((entry / "device" / "numa_node").read_text().strip())
+        except (OSError, ValueError):
+            continue
+        if numa >= 0:
+            jumbo_numas.add(numa)
+    return node_ip if (node_ip_jumbo and len(jumbo_numas) > 1) else None
 
 
 def data_plane_address(ws: Any, fallback_ip: str, index: int) -> str:
@@ -302,6 +361,7 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
         # One of ReceiveIntoVllmMode.MODES ("auto", "on", "off"); _effective_receive_into_vllm caches the resolved
         # choice after the first sync so an "auto" fallback does not retry on every step.
         self.receive_into_vllm = options.receive_into_vllm
+        self.use_data_nics = options.use_data_nics
         self._effective_receive_into_vllm: Optional[bool] = False if self.receive_into_vllm == "off" else None
         self._vllm_params: Optional[dict[str, VllmParam]] = None
         self._vllm_tp_size: Optional[int] = None
@@ -567,13 +627,16 @@ class TPUSyncCheckpointEngine(CheckpointEngine):
         self._close_synchronizer()
 
         logger.info(f"Trainer Rank {self.rank}: binding {len(valid_weights)} tensors to WeightSynchronizer")
-        # The node IP only serves the control RPCs; the weights go over the data NICs tpu-sync finds itself.
+        # The node IP only serves the control RPCs; weights go over data NICs unless split-NUMA isolation
+        # requires pinning to the node IP.
         node_ip = ray.util.get_node_ip_address().strip("[]")
+        bind_ip = resolve_sync_bind_ip(node_ip, self.use_data_nics)
         self._trainer_tpu_sync_ws = create_torch_weight_synchronizer(
             [[t] for _, t in valid_weights],
             local_port=0,
             listener_port=0,
             parallelism=self.parallelism,
+            bind_ip=bind_ip,
         )
 
         def full_shape(name: str, p: torch.Tensor) -> list[int]:
@@ -1076,6 +1139,8 @@ async def _finish_tpu_sync(
     extra_init_kwargs: dict[str, Any] = {} if direct_quantized else {"direct_install_quantized_moe": False}
     if global_dtypes:
         extra_init_kwargs["global_dtypes"] = global_dtypes
+    if options.use_data_nics is not None:
+        extra_init_kwargs["use_data_nics"] = options.use_data_nics
     await asyncio.gather(
         *[
             replica.server_handle.collective_rpc.remote(

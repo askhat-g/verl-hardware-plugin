@@ -211,6 +211,7 @@ class TPUSyncWorkerMixin:
         receive_into_vllm: bool = False,
         direct_install_quantized_moe: bool = True,
         global_dtypes: Optional[dict[str, str]] = None,
+        use_data_nics: Optional[bool] = None,
     ) -> bool:
         """Initialize tpu-sync WeightSynchronizer listener and register with the central tpu-sync controller.
 
@@ -266,6 +267,7 @@ class TPUSyncWorkerMixin:
                 job_name,
                 control_ip,
                 listener_port,
+                use_data_nics=use_data_nics,
             )
 
         # Models with a direct-install layout (``direct_install``: e.g. Qwen3.5, Qwen3 MoE) install each rank's slices
@@ -419,11 +421,13 @@ class TPUSyncWorkerMixin:
             f"total numel={sum(t.numel() for _, t in valid_params)})"
         )
 
+        bind_ip = tpu_sync_engine.resolve_sync_bind_ip(control_ip, use_data_nics)
         self._tpu_sync_ws = tpu_sync_engine.create_torch_weight_synchronizer(
             [[t] for _, t in valid_params],
             local_port=0,
             parallelism=parallelism,
             listener_port=listener_port,
+            bind_ip=bind_ip,
         )
 
         # Whether a tensor can skip the CPU (de)tiling pass is decided by tpu-sync's planner per transfer, from the
@@ -529,6 +533,7 @@ class TPUSyncWorkerMixin:
         job_name: str,
         control_ip: str,
         listener_port: int,
+        use_data_nics: Optional[bool] = None,
     ) -> bool:
         """``init_tpu_sync_on_worker`` for ``receive_into_vllm``: bind vLLM's parameters as the receive buffers.
 
@@ -601,11 +606,13 @@ class TPUSyncWorkerMixin:
             f"({sum(t.numel() * t.element_size() for t in bound.values()) / 2**30:.2f} GiB) as the receive buffers"
         )
 
+        bind_ip = tpu_sync_engine.resolve_sync_bind_ip(control_ip, use_data_nics)
         self._tpu_sync_ws = tpu_sync_engine.create_torch_weight_synchronizer(
             [[t] for _, t in valid_params],
             local_port=0,
             parallelism=parallelism,
             listener_port=listener_port,
+            bind_ip=bind_ip,
         )
         ctrl_client = tpu_sync_api.controller_client(controller_addr)
         ctrl_client.register_work_unit(
