@@ -1075,6 +1075,54 @@ def test_merge_rank_stats_matches_full_tensor_stats():
 # ---------------------------------------------------------------------------
 
 
+def test_resolve_sync_bind_ip_handles_split_numa_and_v6e_layouts(tmp_path):
+    """Auto mode pins to node_ip on split-NUMA jumbo NIC hosts (v7x) and leaves unset otherwise (v6e)."""
+
+    def make_iface(name: str, mtu: int, numa: int) -> None:
+        d = tmp_path / name / "device"
+        d.mkdir(parents=True)
+        (tmp_path / name / "mtu").write_text(f"{mtu}\n")
+        (d / "numa_node").write_text(f"{numa}\n")
+
+    make_iface("eth0", 8896, 0)
+    make_iface("eth1", 8896, 0)
+    make_iface("eth2", 8896, 1)
+    ips_v7x = {"eth0": "10.11.4.216", "eth1": "10.35.1.124", "eth2": "10.34.1.123"}
+
+    # Auto detects split-NUMA jumbo NICs with jumbo node NIC and pins to control IP.
+    assert tpu_sync_engine.resolve_sync_bind_ip("10.11.4.216", None, net_root=tmp_path, iface_ip_fn=ips_v7x.get) == (
+        "10.11.4.216"
+    )
+    # Explicit overrides take precedence.
+    assert tpu_sync_engine.resolve_sync_bind_ip("10.11.4.216", True, net_root=tmp_path, iface_ip_fn=ips_v7x.get) is None
+    assert (
+        tpu_sync_engine.resolve_sync_bind_ip("10.11.4.216", False, net_root=tmp_path, iface_ip_fn=ips_v7x.get)
+        == "10.11.4.216"
+    )
+
+    # Single-NUMA data NICs with standard-MTU eth0 (e.g. v6e) keep bind_ip=None in auto mode.
+    (tmp_path / "eth0" / "mtu").write_text("1460\n")
+    (tmp_path / "eth2" / "device" / "numa_node").write_text("0\n")
+    assert tpu_sync_engine.resolve_sync_bind_ip("10.11.4.216", None, net_root=tmp_path, iface_ip_fn=ips_v7x.get) is None
+
+
+def test_update_tpu_sync_weights_use_data_nics_false_pins_bind_ip(fake_tpu_sync, worker_ext):
+    """Setting use_data_nics=False forwards through to bind both sides to the control IP."""
+    fake_tpu_sync.data_nic_ips = ["10.30.0.1", "10.105.0.1"]
+    tp = trainer_ranks = 2
+    weights = _trainer_weights(seed=0)
+    engines = [_trainer_engine(rank, receive_into_vllm=False, use_data_nics=False) for rank in range(trainer_ranks)]
+    models = [_FakeVllmModel(tp) for _ in range(tp)]
+    samplers = [_make_sampler(worker_ext, rank, tp, model) for rank, model in enumerate(models)]
+    manager, _ = _make_manager(
+        engines, lambda rank: iter(weights.items()), samplers, [], use_data_nics=False, receive_into_vllm=False
+    )
+
+    asyncio.run(tpu_sync_engine.update_tpu_sync_weights(manager, global_steps=0))
+
+    assert all(ws.bind_ip == "10.0.0.1" for ws in fake_tpu_sync.synchronizers)
+
+
 def test_update_tpu_sync_weights_over_data_nics_with_group_size(fake_tpu_sync, worker_ext):
     """Both sides register data-NIC endpoints and the configured group_size reaches the controller."""
     fake_tpu_sync.data_nic_ips = ["10.30.0.1", "10.105.0.1"]

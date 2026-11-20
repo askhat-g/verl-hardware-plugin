@@ -183,6 +183,7 @@ def test_tpu_sync_options_are_parsed_and_typed():
         return_after_d2h=True,
         receive_into_vllm="auto",
         direct_install_quantized_moe=True,
+        use_data_nics=None,
     )
     # Command-line overrides may arrive as strings.
     options = get_tpu_sync_options(
@@ -195,6 +196,7 @@ def test_tpu_sync_options_are_parsed_and_typed():
             "return_after_d2h": "false",
             "receive_into_vllm": "false",
             "direct_install_quantized_moe": "false",
+            "use_data_nics": "false",
         }
     )
     assert options == TPUSyncOptions(
@@ -206,6 +208,7 @@ def test_tpu_sync_options_are_parsed_and_typed():
         return_after_d2h=False,
         receive_into_vllm="off",
         direct_install_quantized_moe=False,
+        use_data_nics=False,
     )
 
 
